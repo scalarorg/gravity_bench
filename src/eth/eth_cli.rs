@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::time::{sleep, Duration};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use url::Url;
 
 /// Format large numbers with appropriate suffixes (K, M, B)
@@ -476,6 +476,92 @@ impl EthHttpCli {
         final_result
     }
 
+    /// Send multiple raw transactions in a batch using eth_sendRawTransactions
+    ///
+    /// This is more efficient than calling send_raw_tx multiple times as it uses
+    /// a single RPC call with batch transaction pool insertion.
+    pub async fn send_raw_txs(&self, tx_bytes_vec: Vec<Vec<u8>>) -> Result<Vec<TxHash>> {
+        if tx_bytes_vec.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let batch_size = tx_bytes_vec.len();
+        let idx = rand::thread_rng().gen_range(0..self.inner.len());
+        let rpc_url = self.rpc.as_str();
+        let start = Instant::now();
+
+        // info!(
+        //     "🚀 EthHttpCli: Sending batch of {} transactions via gravity_submitBatch to {}",
+        //     batch_size, rpc_url
+        // );
+
+        // Convert Vec<Vec<u8>> to Vec<Bytes>
+        let transactions: Vec<alloy::primitives::Bytes> =
+            tx_bytes_vec.into_iter().map(|bytes| bytes.into()).collect();
+
+        let op = async {
+            // Use the new batch RPC method
+            // Wrap in a tuple - raw_request expects parameters as a tuple
+            debug!(
+                "Calling gravity_submitBatch RPC: batch_size={}, rpc={}",
+                transactions.len(),
+                rpc_url
+            );
+            let hashes = self.inner[idx]
+                .raw_request::<(Vec<alloy::primitives::Bytes>,), Vec<TxHash>>(
+                    "gravity_submitBatch".into(),
+                    (transactions,),
+                )
+                .await?;
+            anyhow::Ok(hashes)
+        };
+
+        let result = tokio::time::timeout(Duration::from_secs(30), op).await;
+
+        let final_result = match result {
+            Ok(Ok(hashes)) => {
+                let elapsed = start.elapsed();
+                info!(
+                    "✅ EthHttpCli: Batch RPC call succeeded: {} transactions sent in {:?} via eth_sendRawTransactions to {}",
+                    hashes.len(),
+                    elapsed,
+                    rpc_url
+                );
+                Ok(hashes)
+            }
+            Ok(Err(e)) => {
+                let elapsed = start.elapsed();
+                warn!(
+                    "❌ EthHttpCli: Batch RPC call failed: {} transactions failed after {:?}, rpc={}, error={}",
+                    batch_size,
+                    elapsed,
+                    rpc_url,
+                    e
+                );
+                Err(anyhow::Error::from(e))
+            }
+            Err(e) => {
+                let elapsed = start.elapsed();
+                warn!(
+                    "❌ EthHttpCli: Batch RPC call timed out: {} transactions timed out after {:?}, rpc={}, error={}",
+                    batch_size,
+                    elapsed,
+                    rpc_url,
+                    e
+                );
+                Err(anyhow::Error::from(e))
+            }
+        };
+
+        self.update_metrics(
+            "eth_sendRawTransactions",
+            final_result.is_ok(),
+            start.elapsed(),
+        )
+        .await;
+
+        final_result
+    }
     /// Send signed transaction envelope
     #[allow(unused)]
     pub async fn send_tx_envelope(&self, tx_envelope: TxEnvelope) -> Result<TxHash> {

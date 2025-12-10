@@ -104,20 +104,61 @@ def compile_all_contracts():
 # --- 2. Deployment & Interaction ---
 # ==============================================================================
 def send_transaction(w3, tx, private_key, description):
-    """Signs and sends a transaction, then waits for the receipt."""
+    """Signs and sends a transaction via gravity_submitBatch, with fallback to eth_sendRawTransaction."""
+    signed_tx = w3.eth.account.sign_transaction(tx, private_key=private_key)
+    
+    # Try gravity_submitBatch first
     try:
-        signed_tx = w3.eth.account.sign_transaction(tx, private_key=private_key)
-        tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
-        print(f"  > {description} transaction sent, TX Hash: {tx_hash.hex()}")
+        # Convert raw transaction to hex string with 0x prefix
+        tx_bytes_hex = "0x" + signed_tx.raw_transaction.hex()
+        
+        # Call gravity_submitBatch RPC method
+        # Parameters: [transactions: array of hex strings, mode: optional "pool"|"pipe"]
+        # Returns: array of transaction hashes (as hex strings)
+        # Using "pipe" mode by default (OrderedBlock injection)
+        transactions_array = [tx_bytes_hex]
+        params = [transactions_array, "pipe"]
+        
+        result = w3.manager.request_blocking("gravity_submitBatch", params)
+        
+        # Extract transaction hash from the returned array
+        if not result or len(result) == 0:
+            raise Exception("gravity_submitBatch returned empty result")
+        
+        tx_hash_hex = result[0]
+        # Ensure the transaction hash is a hex string with 0x prefix
+        if isinstance(tx_hash_hex, str):
+            # Ensure it has 0x prefix
+            tx_hash = tx_hash_hex if tx_hash_hex.startswith('0x') else '0x' + tx_hash_hex
+        else:
+            # Convert bytes to hex string if needed
+            tx_hash = '0x' + tx_hash_hex.hex() if hasattr(tx_hash_hex, 'hex') else str(tx_hash_hex)
+        
+        print(f"  > {description} transaction sent via gravity_submitBatch, TX Hash: {tx_hash}")
         tx_receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
         if tx_receipt['status'] == 0:
             print(f"  ❌ {description} transaction FAILED.")
             return None
         print(f"  ✅ {description} transaction successful.")
         return tx_receipt
+        
     except Exception as e:
-        print(f"  ❌ Exception during '{description}' transaction: {e}")
-        return None
+        # Fallback to eth_sendRawTransaction if gravity_submitBatch fails
+        print(f"  ⚠️  gravity_submitBatch failed ({e}), falling back to eth_sendRawTransaction...")
+        try:
+            tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+            print(f"  > {description} transaction sent via eth_sendRawTransaction (fallback), TX Hash: {tx_hash.hex()}")
+            tx_receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
+            if tx_receipt['status'] == 0:
+                print(f"  ❌ {description} transaction FAILED.")
+                return None
+            print(f"  ✅ {description} transaction successful.")
+            return tx_receipt
+        except Exception as e2:
+            print(f"  ❌ Exception during '{description}' transaction (both methods failed): {e2}")
+            import traceback
+            traceback.print_exc()
+            return None
 
 def deploy_contract(w3, account, private_key, contract_interface, contract_name, *args):
     """A generic contract deployment function."""
