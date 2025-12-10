@@ -56,6 +56,24 @@ pub struct PerformanceConfig {
     pub max_pool_size: usize,
     /// Duration of the benchmark in seconds
     pub duration_secs: u64,
+    /// Batch size for batch transaction sending (0 = disabled, use individual sending)
+    /// Recommended: 100-1000 for optimal performance
+    #[serde(default = "default_batch_size")]
+    pub batch_size: usize,
+    /// Batch timeout in milliseconds - send batch even if not full after this timeout
+    /// Recommended: 50-200ms for low latency, 200-500ms for higher throughput
+    #[serde(default = "default_batch_timeout_ms")]
+    pub batch_timeout_ms: u64,
+}
+
+fn default_batch_size() -> usize {
+    // Default batch size
+    100
+}
+
+fn default_batch_timeout_ms() -> u64 {
+    // Default 100ms timeout
+    100
 }
 
 impl BenchConfig {
