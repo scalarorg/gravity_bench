@@ -16,6 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::io::{AsyncBufReadExt, BufReader as TokioBufReader};
+
 use tracing::{info, Level};
 
 use crate::{
@@ -39,6 +40,13 @@ struct Args {
 
     #[arg(long, default_value = "bench_config.toml")]
     config: String,
+
+    #[arg(
+        long,
+        default_value = "info",
+        help = "Set the log level (trace, debug, info, warn, error)"
+    )]
+    log_level: String,
 }
 
 // mod uniswap;
@@ -355,6 +363,8 @@ async fn start_bench() -> Result<()> {
         monitor.clone(),
         benchmark_config.performance.max_pool_size,
         Some(benchmark_config.target_tps as u32),
+        benchmark_config.performance.batch_size,
+        benchmark_config.performance.batch_timeout_ms,
     )
     .start();
     let init_nonce_map = get_init_nonce_map(
@@ -425,11 +435,11 @@ async fn start_bench() -> Result<()> {
 
 async fn init_nonce(accout_generator: &mut AccountGenerator, eth_client: Arc<EthHttpCli>) {
     tracing::info!("Initializing nonce...");
-    
+
     // Collect all accounts first to get total count
     let accounts: Vec<_> = accout_generator.accouts_nonce_iter().collect();
     let total_accounts = accounts.len() as u64;
-    
+
     // Create progress bar
     let pb = ProgressBar::new(total_accounts);
     pb.set_style(
@@ -438,10 +448,10 @@ async fn init_nonce(accout_generator: &mut AccountGenerator, eth_client: Arc<Eth
             .unwrap()
             .progress_chars("#>-"),
     );
-    
+
     let pb = Arc::new(pb);
     let start_time = Instant::now();
-    
+
     let tasks = accounts.into_iter().map(|(account, nonce)| {
         let client = eth_client.clone();
         let addr = account.clone();
@@ -465,7 +475,7 @@ async fn init_nonce(accout_generator: &mut AccountGenerator, eth_client: Arc<Eth
         .buffer_unordered(1024)
         .collect::<Vec<_>>()
         .await;
-    
+
     pb.finish_with_message("Done");
     let elapsed = start_time.elapsed();
     let rate = total_accounts as f64 / elapsed.as_secs_f64();

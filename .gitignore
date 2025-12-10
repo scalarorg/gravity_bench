@@ -16,3 +16,5 @@ log.log
 *.log
 venv/
 accounts.txt
+data
+__pycache__
