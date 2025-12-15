@@ -17,6 +17,27 @@ use tokio::time::{sleep, Duration};
 use tracing::{debug, info, warn};
 use url::Url;
 
+/// Default wait time when buffer is full (1 second)
+const WAITING_FOR_BUFFER: Duration = Duration::from_secs(1);
+
+/// Response structure for gravity_submitBatch
+#[derive(Debug, Clone, serde::Deserialize)]
+struct SubmitBatchResponse {
+    /// Array of transaction hashes
+    pub hashes: Vec<TxHash>,
+    /// Current buffer size after adding transactions
+    pub buffer_size: usize,
+}
+
+/// Buffer status structure
+#[derive(Debug, Clone, serde::Deserialize)]
+struct BufferStatus {
+    /// Current number of queued transactions
+    pub queued: usize,
+    /// Maximum buffer size
+    pub max_size: usize,
+}
+
 /// Format large numbers with appropriate suffixes (K, M, B)
 fn format_large_number(num: u64) -> String {
     if num >= 1_000_000_000 {
@@ -476,10 +497,23 @@ impl EthHttpCli {
         final_result
     }
 
+    /// Get buffer status from the RPC node
+    async fn get_buffer_status(&self) -> Result<BufferStatus> {
+        let idx = rand::thread_rng().gen_range(0..self.inner.len());
+        let status: BufferStatus = self.inner[idx]
+            .raw_request::<(), BufferStatus>("gravity_getBufferStatus".into(), ())
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to get buffer status: {}", e))?;
+        Ok(status)
+    }
+
     /// Send multiple raw transactions in a batch using eth_sendRawTransactions
     ///
     /// This is more efficient than calling send_raw_tx multiple times as it uses
     /// a single RPC call with batch transaction pool insertion.
+    ///
+    /// Before submitting, checks if the buffer has space. If not, waits for WAITING_FOR_BUFFER
+    /// duration before retrying the check.
     pub async fn send_raw_txs(&self, tx_bytes_vec: Vec<Vec<u8>>) -> Result<Vec<TxHash>> {
         if tx_bytes_vec.is_empty() {
             return Ok(Vec::new());
@@ -490,77 +524,121 @@ impl EthHttpCli {
         let rpc_url = self.rpc.as_str();
         let start = Instant::now();
 
-        // info!(
-        //     "🚀 EthHttpCli: Sending batch of {} transactions via gravity_submitBatch to {}",
-        //     batch_size, rpc_url
-        // );
-
         // Convert Vec<Vec<u8>> to Vec<Bytes>
         let transactions: Vec<alloy::primitives::Bytes> =
             tx_bytes_vec.into_iter().map(|bytes| bytes.into()).collect();
 
-        let op = async {
-            // Use the new batch RPC method
-            // Wrap in a tuple - raw_request expects parameters as a tuple
-            debug!(
-                "Calling gravity_submitBatch RPC: batch_size={}, rpc={}",
-                transactions.len(),
-                rpc_url
-            );
-            let hashes = self.inner[idx]
-                .raw_request::<(Vec<alloy::primitives::Bytes>,), Vec<TxHash>>(
-                    "gravity_submitBatch".into(),
-                    (transactions,),
-                )
-                .await?;
-            anyhow::Ok(hashes)
-        };
+        // Retry loop: check buffer status and submit, retry indefinitely if buffer is full
+        // This ensures no transactions are lost
+        loop {
+            // Check buffer status before submitting
+            let buffer_has_space = match self.get_buffer_status().await {
+                Ok(status) => {
+                    if status.queued + batch_size > status.max_size {
+                        info!(
+                            "⏳ Buffer full: queued={}, max_size={}, batch_size={}. Waiting {}ms before retry",
+                            status.queued,
+                            status.max_size,
+                            batch_size,
+                            WAITING_FOR_BUFFER.as_millis()
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                }
+                Err(e) => {
+                    // If we can't get buffer status, log a warning but proceed anyway
+                    // This allows backward compatibility if the RPC method is not available
+                    warn!(
+                        "⚠️ Failed to get buffer status: {}. Proceeding with submission anyway.",
+                        e
+                    );
+                    true
+                }
+            };
 
-        let result = tokio::time::timeout(Duration::from_secs(30), op).await;
+            if !buffer_has_space {
+                sleep(WAITING_FOR_BUFFER).await;
+                continue;
+            }
 
-        let final_result = match result {
-            Ok(Ok(hashes)) => {
-                let elapsed = start.elapsed();
-                info!(
-                    "✅ EthHttpCli: Batch RPC call succeeded: {} transactions sent in {:?} via eth_sendRawTransactions to {}",
-                    hashes.len(),
-                    elapsed,
+            // Attempt to submit the batch
+            let op = async {
+                // Use the new batch RPC method
+                // Wrap in a tuple - raw_request expects parameters as a tuple
+                debug!(
+                    "Calling gravity_submitBatch RPC: batch_size={}, rpc={}",
+                    transactions.len(),
                     rpc_url
                 );
-                Ok(hashes)
-            }
-            Ok(Err(e)) => {
-                let elapsed = start.elapsed();
-                warn!(
-                    "❌ EthHttpCli: Batch RPC call failed: {} transactions failed after {:?}, rpc={}, error={}",
-                    batch_size,
-                    elapsed,
-                    rpc_url,
-                    e
-                );
-                Err(anyhow::Error::from(e))
-            }
-            Err(e) => {
-                let elapsed = start.elapsed();
-                warn!(
-                    "❌ EthHttpCli: Batch RPC call timed out: {} transactions timed out after {:?}, rpc={}, error={}",
-                    batch_size,
-                    elapsed,
-                    rpc_url,
-                    e
-                );
-                Err(anyhow::Error::from(e))
-            }
-        };
+                let response: SubmitBatchResponse = self.inner[idx]
+                    .raw_request::<(Vec<alloy::primitives::Bytes>,), SubmitBatchResponse>(
+                        "gravity_submitBatch".into(),
+                        (transactions.clone(),),
+                    )
+                    .await?;
+                anyhow::Ok((response.hashes, response.buffer_size))
+            };
 
-        self.update_metrics(
-            "eth_sendRawTransactions",
-            final_result.is_ok(),
-            start.elapsed(),
-        )
-        .await;
+            let result = tokio::time::timeout(Duration::from_secs(30), op).await;
 
-        final_result
+            match result {
+                Ok(Ok((hashes, buffer_size))) => {
+                    let elapsed = start.elapsed();
+                    info!(
+                        "✅ EthHttpCli: Batch RPC call succeeded: {} transactions sent in {:?} via gravity_submitBatch to {}, buffer_size={}",
+                        hashes.len(),
+                        elapsed,
+                        rpc_url,
+                        buffer_size
+                    );
+                    // Update metrics before returning
+                    self.update_metrics("eth_sendRawTransactions", true, elapsed)
+                        .await;
+                    return Ok(hashes);
+                }
+                Ok(Err(e)) => {
+                    let error_string = e.to_string().to_lowercase();
+
+                    // Check if error is due to buffer full - if so, retry
+                    if error_string.contains("buffer full")
+                        || error_string.contains("buffer is full")
+                    {
+                        warn!(
+                            "⏳ Buffer full error during submission: {}. Waiting {}ms before retry",
+                            e,
+                            WAITING_FOR_BUFFER.as_millis()
+                        );
+                        sleep(WAITING_FOR_BUFFER).await;
+                        continue; // Retry the submission
+                    }
+
+                    // For other errors, return them (non-buffer-full errors)
+                    let elapsed = start.elapsed();
+                    warn!(
+                        "❌ EthHttpCli: Batch RPC call failed: {} transactions failed after {:?}, rpc={}, error={}",
+                        batch_size,
+                        elapsed,
+                        rpc_url,
+                        e
+                    );
+                    // Update metrics before returning
+                    self.update_metrics("eth_sendRawTransactions", false, elapsed)
+                        .await;
+                    return Err(anyhow::Error::from(e));
+                }
+                Err(_) => {
+                    // Timeout - retry the submission
+                    warn!(
+                        "⏳ Batch RPC call timed out. Waiting {}ms before retry",
+                        WAITING_FOR_BUFFER.as_millis()
+                    );
+                    sleep(WAITING_FOR_BUFFER).await;
+                    continue; // Retry the submission
+                }
+            }
+        }
     }
     /// Send signed transaction envelope
     #[allow(unused)]

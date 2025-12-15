@@ -289,6 +289,14 @@ impl GravityBenchNode {
                 buffer.take_batch(batch_size).await
             }
         };
+        info!("🔨 [GravityBenchNode] Creating OrderedBlock #{} with {} transactions. Remaining transactions in buffer: {}", 
+            new_block_number,
+            batch.len(),
+            txn_buffer_len - batch.len()
+        );
+        // for (i, tx) in batch.iter().enumerate() {
+        //     info!("🔨 [GravityBenchNode] Transaction {}: {:?}", i + 1, tx.0.hash());
+        // }
         // // Get the latest canonical block hash to use as parent_id for the new OrderedBlock
         // let latest_block_hash = provider
         //     .block_hash(latest_block_number)

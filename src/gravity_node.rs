@@ -61,6 +61,15 @@ pub enum BatchMode {
     Pipe,
 }
 
+/// Response from submit_batch containing transaction hashes and buffer status
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SubmitBatchResponse {
+    /// Array of transaction hashes
+    pub hashes: Vec<B256>,
+    /// Current buffer size after adding transactions
+    pub buffer_size: usize,
+}
+
 /// RPC API trait for gravity bench namespace
 #[rpc(server, namespace = "gravity")]
 pub trait GravityBenchApi {
@@ -71,13 +80,13 @@ pub trait GravityBenchApi {
     /// * `mode` - Optional injection mode: "pool" (transaction pool) or "pipe" (OrderedBlock injection). Defaults to "pipe"
     ///
     /// # Returns
-    /// Array of transaction hashes
+    /// SubmitBatchResponse containing transaction hashes and current buffer size
     #[method(name = "submitBatch")]
     async fn submit_batch(
         &self,
         transactions: Vec<alloy::primitives::Bytes>,
         mode: Option<BatchMode>,
-    ) -> RpcResult<Vec<B256>>;
+    ) -> RpcResult<SubmitBatchResponse>;
 
     /// Get buffer status
     #[method(name = "getBufferStatus")]
@@ -101,7 +110,7 @@ impl GravityBenchApiServer for GravityBenchRpc {
         &self,
         transactions: Vec<alloy::primitives::Bytes>,
         mode: Option<BatchMode>,
-    ) -> RpcResult<Vec<B256>> {
+    ) -> RpcResult<SubmitBatchResponse> {
 
         let injection_mode = mode.unwrap_or(BatchMode::Pipe);
         let batch_size = transactions.len();
@@ -122,7 +131,11 @@ impl GravityBenchApiServer for GravityBenchRpc {
                 
                 // For now, fall back to pipe mode
                 // TODO: Implement proper pool mode support
-                Ok(Vec::new())
+                let BufferStatus { queued, .. } = self.buffer.get_status().await;
+                Ok(SubmitBatchResponse {
+                    hashes: Vec::new(),
+                    buffer_size: queued,
+                })
             }
             BatchMode::Pipe => {
                 let mut hashes = Vec::new();
@@ -169,25 +182,30 @@ impl GravityBenchApiServer for GravityBenchRpc {
                     }
                 }
 
-                // Get buffer status after adding transactions
-                let BufferStatus { queued, max_size } = self.buffer.get_status().await;
-                let txs_len = txs.len();
+                // Get buffer status before adding transactions
+                let BufferStatus { queued: buffer_before, max_size } = self.buffer.get_status().await;
                 // Add transaction to simple transaction buffer
                 if !self.buffer.add_transactions(txs).await {
                     return Err(ErrorObjectOwned::owned(
                         -32000,
-                        format!("Buffer full {} + {} > {}", queued, batch_size, max_size),
+                        format!("Buffer full {} + {} > {}", buffer_before, batch_size, max_size),
                         None::<()>,
                     ));
                 }
+                
+                // Get buffer status after adding transactions
+                let BufferStatus { queued: buffer_after, .. } = self.buffer.get_status().await;
                 debug!(
                     "📊 [RPC] Pipe batch processing complete: accepted={}, buffer_before={}, buffer_after={}",
                     accepted,
-                    queued,
-                    queued + txs_len
+                    buffer_before,
+                    buffer_after
                 );
 
-                Ok(hashes)
+                Ok(SubmitBatchResponse {
+                    hashes,
+                    buffer_size: buffer_after,
+                })
             }
         }
     }

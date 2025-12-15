@@ -559,7 +559,7 @@ impl Consumer {
                         }
 
                         // Branch 2: Check timeout for buffer if it's below threshold
-                        _ = tokio::time::sleep(Duration::from_millis(100)), if !tx_buffer.is_empty() => {
+                        _ = tokio::time::sleep(Duration::from_millis(batch_timeout_ms)), if !tx_buffer.is_empty() => {
                             if let Some(first_time) = buffer_first_txn_time {
                                 if first_time.elapsed() >= batch_timeout {
                                     debug!("Buffer timeout reached ({}ms), processing {} buffered transactions", batch_timeout_ms, tx_buffer.len());
