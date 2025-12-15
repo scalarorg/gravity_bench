@@ -28,7 +28,7 @@ use greth::{
     reth_provider::{BlockHashReader, BlockNumReader, BlockReader},    
     reth_pipe_exec_layer_ext_v2::{self, ExecutionArgs, PipeExecLayerApi}
 };
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, mpsc};
 use reth_primitives::TransactionSigned;
 use node::PipeExecLayerApiTrait;
 use reth_rpc_api::eth::helpers::EthCall;
@@ -329,6 +329,10 @@ fn main() {
                     
                     info!("✅ [GravityBench] Pipe execution layer API created");
                     
+                    // Create channel for coordinator to signal block execution completion
+                    // (block_number, new_epoch)
+                    let (block_executed_tx, block_executed_rx) = mpsc::unbounded_channel::<(u64, Option<u64>)>();
+                    
                     // Create coordinator (similar to RethCoordinator in gravity_sdk)
                     use crate::node::coordinator::GravityBenchCoordinator;
                     let pipeline_api_arc = Arc::new(pipeline_api);
@@ -336,6 +340,7 @@ fn main() {
                         pipeline_api_arc.clone(),
                         provider.clone(),
                         chain_id,
+                        Some(block_executed_tx),
                     );
                     
                     // Start coordinator tasks (start_execution, start_commit_vote, start_commit)
@@ -385,16 +390,15 @@ fn main() {
                     // - Dev mode miner: Mines transactions from pool (setup transactions)
                     // - OrderedBlock injection: Handles transactions from BlockBufferManager (test transactions)
                    
-                    let engine_events = full_node.add_ons_handle.engine_events.new_listener();
                     tokio::spawn(async move {
                         info!("🔄 [GravityBench] Starting OrderedBlock injection background task");
                         info!("   This will handle transactions from gravity_bench_submitBatch");
                         info!("   Dev mode miner will continue to mine transactions from transaction pool");
-                        info!("   OrderedBlock injection will sync with LocalMiner blocks automatically");
+                        info!("   OrderedBlock injection triggered by coordinator when block execution completes");
                          // Pass provider so OrderedBlock injection can sync with LocalMiner blocks
                         let pipe_api = bench_node.get_pipe_api();
                         bench_node
-                            .run_injection_loop(pipe_api, eth_api, engine_events, Some(hex_to_32_bytes(PROPOSER_ADDRESS1)),latest_block_number, latest_block_hash)
+                            .run_injection_loop(pipe_api, eth_api, block_executed_rx, Some(hex_to_32_bytes(PROPOSER_ADDRESS1)),latest_block_number, latest_block_hash)
                             .await;
                     });
                     

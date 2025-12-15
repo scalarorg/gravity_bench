@@ -1,14 +1,9 @@
 use alloy::primitives::{Address, B256, U256};
-use alloy_consensus::BlockHeader;
 use alloy_rpc_types_eth::TransactionRequest;
 use anyhow::Result;
-use futures::StreamExt;
-use greth::reth_node_api::ConsensusEngineEvent;
 use greth::reth_pipe_exec_layer_ext_v2::{OrderedBlock, PipeExecLayerApi};
-use reth_primitives::NodePrimitives;
 use reth_rpc_api::eth::helpers::EthCall;
 use reth_rpc_eth_api::RpcTypes;
-use reth_tokio_util::EventStream;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -19,6 +14,7 @@ use crate::node::buffer::TransactionBuffer;
 use crate::node::get_current_epoch;
 /// Gravity node setup for benchmarking
 pub struct GravityBenchNode {
+    epoch: Arc<RwLock<u64>>,
     pipe_api: Arc<Mutex<Option<Arc<dyn PipeExecLayerApiTrait>>>>,
     buffer: Arc<TransactionBuffer>,
     batch_size: usize,
@@ -43,6 +39,7 @@ impl GravityBenchNode {
         info!("Please start gravity_node separately with MOCK_CONSENSUS=true");
 
         Ok(Self {
+            epoch: Arc::new(RwLock::new(0)),
             pipe_api: Arc::new(Mutex::new(None)),
             buffer,
             batch_size,
@@ -81,26 +78,27 @@ impl GravityBenchNode {
     ///
     /// This function uses a queue-based pattern:
     /// 1. Interval task: Periodically creates OrderedBlocks and adds them to a queue
-    /// 2. Event handler: Listens for ConsensusEngineEvent and new block creation events,
-    ///    and sends blocks from the queue to pipe_api when events fire
+    /// 2. Event handler: Listens for block execution completion signals from coordinator,
+    ///    and sends blocks from the queue to pipe_api when signals are received
     ///
     /// # Arguments
     /// * `pipe_api` - Pipe API for injecting OrderedBlocks
     /// * `eth_api` - Eth API for fetching epoch from contract
-    /// * `provider` - Provider for syncing with canonical chain (LocalMiner blocks)
-    /// * `engine_events` - Stream of consensus engine events to listen for canonical block events
-    pub async fn run_injection_loop<EthApi, N>(
+    /// * `block_executed_rx` - Channel receiver for block execution completion signals from coordinator
+    /// * `proposer` - Proposer address for OrderedBlock
+    /// * `last_created_block_number` - Last created block number
+    /// * `last_created_block_id` - Last created block ID
+    pub async fn run_injection_loop<EthApi>(
         &self,
         pipe_api: Arc<Mutex<Option<Arc<dyn PipeExecLayerApiTrait>>>>,
         eth_api: EthApi,
-        mut engine_events: EventStream<ConsensusEngineEvent<N>>,
+        mut block_executed_rx: mpsc::UnboundedReceiver<(u64, Option<u64>)>,
         proposer: Option<[u8; 32]>,
         last_created_block_number: u64,
         last_created_block_id: B256,
     ) where
         EthApi: EthCall + reth_rpc_api::eth::helpers::EthState + Send + Sync + 'static,
         EthApi::NetworkTypes: RpcTypes<TransactionRequest = TransactionRequest>,
-        N: NodePrimitives,
     {
         info!(
             "🚀 [GravityBenchNode] Starting OrderedBlock injection loop: batch_size={}, block_interval_ms={}ms",
@@ -110,16 +108,21 @@ impl GravityBenchNode {
         let mut lastest_block_number = last_created_block_number;
         let mut lastest_block_time: Option<u64> = None;
         let mut lastest_block_id = last_created_block_id;
-        let mut last_sent_time = 0;
         // OrderedBlock queue: stores blocks waiting to be sent to pipe_api
         let block_queue: Arc<Mutex<VecDeque<OrderedBlock>>> = Arc::new(Mutex::new(VecDeque::new()));
         // Channel to signal when a new OrderedBlock is created
         let (block_created_tx, mut block_created_rx) = mpsc::unbounded_channel::<()>();
-        // Shared state: latest canonical block number
-        let latest_canonical_block = Arc::new(RwLock::new(None));
-
+        // Shared state for last sent time
+        let last_sent_time = Arc::new(Mutex::new(0u128));
+        // Shared state: latest executed block number (from coordinator signals)
+        let latest_executed_block = Arc::new(RwLock::new(last_created_block_number));
+        // Shared state: latest sent block number (to track what we've sent to pipe)
+        let latest_sent_block = Arc::new(RwLock::new(last_created_block_number));
+        let current_epoch = get_current_epoch(&eth_api, last_created_block_number).await;
+        *self.epoch.write().await = current_epoch;
         // Create empty NIL OrderedBlock
         if let Some(empty_nil_block) = Self::create_ordered_block(
+            current_epoch,
             last_created_block_number,
             last_created_block_id,
             None,
@@ -133,74 +136,103 @@ impl GravityBenchNode {
             block_queue.lock().await.push_back(empty_nil_block);
             let _ = block_created_tx.send(());
         }
-        // Spawn event handler task: listens to ConsensusEngineEvent and new block creation events
+        // Spawn event handler task: listens to block execution completion signals from coordinator
         let event_pipe_api = pipe_api.clone();
         let event_block_queue = block_queue.clone();
-        let event_canonical_block = latest_canonical_block.clone();
+        let event_eth_api = eth_api.clone();
+        let event_last_sent_time = last_sent_time.clone();
+        let event_latest_executed_block = latest_executed_block.clone();
+        let event_latest_sent_block = latest_sent_block.clone();
+        let current_epoch_arc = self.epoch.clone();
         tokio::spawn(async move {
             info!(
-                "[GravityBenchNode] Event handler task started - listening to ConsensusEngineEvent and block creation events"
+                "[GravityBenchNode] Event handler task started - listening to block execution completion signals from coordinator and block creation events"
             );
             loop {
                 tokio::select! {
-                    // Listen for ConsensusEngineEvent
-                    event_result = engine_events.next() => {
-                        match event_result {
-                            Some(event) => {
-                                match event {
-                                    ConsensusEngineEvent::CanonicalChainCommitted(head, _) => {
-                                        let canonical_block_number = (*head).number();
-                                        *event_canonical_block.write().await = Some(canonical_block_number);
-
-                                        // Send block from queue to pipe_api
-                                        let (sent_time, block_number, block_timestamp, tx_count, queue_size) = Self::try_send_block_from_queue(&event_pipe_api, &eth_api, &event_block_queue, &event_canonical_block).await;
-                                        if sent_time > 0 {
-                                            info!("✅ [GravityBenchNode] Successfully sent block to pipe exec layer. [CanonicalChainCommitted] Elapsed time={} milliseconds, block number={} with {} transactions, time in queue {} ms, block queue size={}",
-                                                sent_time - last_sent_time,
-                                                block_number,
-                                                tx_count,
-                                                sent_time - block_timestamp as u128 * 1000,
-                                                queue_size
-                                            );
-                                            last_sent_time = sent_time;
+                    // Listen for block execution completion signal from coordinator
+                    executed_block_number = block_executed_rx.recv() => {
+                        match executed_block_number {
+                            Some((executed_block_number, new_epoch)) => {
+                                // Update epoch
+                                if let Some(epoch) = new_epoch {
+                                    *current_epoch_arc.write().await = epoch;
+                                }
+                                // Update latest executed block number
+                                *event_latest_executed_block.write().await = executed_block_number;
+                                
+                                // Try to send block from queue to pipe_api
+                                let latest_executed = *event_latest_executed_block.read().await;
+                                let latest_sent = *event_latest_sent_block.read().await;
+                                let (sent_time, block_number, block_timestamp, tx_count, queue_size) = Self::try_send_block_from_queue(&event_pipe_api, &event_block_queue, latest_executed, &event_latest_sent_block, &current_epoch_arc).await;
+                                if sent_time > 0 {
+                                    let prev_sent_time = *event_last_sent_time.lock().await;
+                                    info!("✅ [GravityBenchNode] Successfully sent block to pipe exec layer. [BlockExecuted] Elapsed time={} milliseconds, block number={} with {} transactions, time in queue {} ms, block queue size={}, latest_sent={}, latest_executed={}",
+                                        sent_time - prev_sent_time,
+                                        block_number,
+                                        tx_count,
+                                        sent_time - block_timestamp as u128 * 1000,
+                                        queue_size,
+                                        latest_sent,
+                                        latest_executed
+                                    );
+                                    *event_last_sent_time.lock().await = sent_time;
+                                } else {
+                                    let queue_info = {
+                                        let queue = event_block_queue.lock().await;
+                                        if queue.is_empty() {
+                                            "empty".to_string()
                                         } else {
-                                            info!("⏳ [GravityBenchNode] No block available in queue to send");
+                                            let first = queue.front().map(|b| b.number).unwrap_or(0);
+                                            let last = queue.back().map(|b| b.number).unwrap_or(0);
+                                            format!("blocks {}-{}", first, last)
                                         }
-                                    }
-                                    ConsensusEngineEvent::CanonicalBlockAdded(executed_block, elapsed) => {
-                                        let block = executed_block.sealed_block();
-                                        let block_number = block.header().number();
-                                        debug!(
-                                            "✓ [GravityBenchNode] Canonical block added: block #{} (hash: {:?}) in {:?}",
-                                            block_number,
-                                            block.hash(),
-                                            elapsed
-                                        );
-                                    }
-                                    _ => {
-                                        // Ignore other events
-                                    }
+                                    };
+                                    info!("⏳ [GravityBenchNode] No block available in queue to send. Queue: {}, latest_sent={}, latest_executed={}", queue_info, latest_sent, latest_executed);
                                 }
                             }
                             None => {
-                                warn!("[GravityBenchNode] Engine events stream ended");
+                                warn!("[GravityBenchNode] Block execution signal channel closed");
                                 break;
                             }
                         }
                     }
-                    // Listen for new block creation events and send to pipe_api
+                    // Listen for new block creation events and try to send to pipe_api
                     _ = block_created_rx.recv() => {
-                        // Send block from queue to pipe_api
-                        let (sent_time, block_number, block_timestamp, tx_count, queue_size) = Self::try_send_block_from_queue(&event_pipe_api,  &eth_api, &event_block_queue, &latest_canonical_block).await;
-                        if sent_time > 0  {
-                            info!("✅ [GravityBenchNode] Successfully sent block to pipe exec layer. [BlockCreated] Elapsed time={} milliseconds, block number={} with {} transactions, time in queue {} ms, block queue size={}",
-                                sent_time - last_sent_time,
+                        // Try to send block from queue using latest executed block number
+                        let latest_executed = *event_latest_executed_block.read().await;
+                        let latest_sent = *event_latest_sent_block.read().await;
+                        let (sent_time, block_number, block_timestamp, tx_count, queue_size) 
+                            = Self::try_send_block_from_queue(
+                                &event_pipe_api, 
+                                &event_block_queue, 
+                                latest_executed, 
+                                &event_latest_sent_block, 
+                                &current_epoch_arc).await;
+                        if sent_time > 0 {
+                            let prev_sent_time = *event_last_sent_time.lock().await;
+                            info!("✅ [GravityBenchNode] Successfully sent block to pipe exec layer. [BlockCreated] Elapsed time={} milliseconds, block number={} with {} transactions, time in queue {} ms, block queue size={}, latest_sent={}, latest_executed={}",
+                                sent_time - prev_sent_time,
                                 block_number,
                                 tx_count,
                                 sent_time - block_timestamp as u128 * 1000,
-                                queue_size
+                                queue_size,
+                                latest_sent,
+                                latest_executed
                             );
-                            last_sent_time = sent_time;
+                            *event_last_sent_time.lock().await = sent_time;
+                        } else {
+                            let queue_info = {
+                                let queue = event_block_queue.lock().await;
+                                if queue.is_empty() {
+                                    "empty".to_string()
+                                } else {
+                                    let first = queue.front().map(|b| b.number).unwrap_or(0);
+                                    let last = queue.back().map(|b| b.number).unwrap_or(0);
+                                    format!("blocks {}-{}", first, last)
+                                }
+                            };
+                            debug!("⏳ [GravityBenchNode] Block created but not ready to send yet. Queue: {}, latest_sent={}, latest_executed={}", queue_info, latest_sent, latest_executed);
                         }
                     }
                 }
@@ -217,6 +249,7 @@ impl GravityBenchNode {
             interval.tick().await;
             // Create the next block and add to queue
             if let Some(ordered_block) = Self::create_ordered_block(
+                *self.epoch.read().await,
                 lastest_block_number, //
                 lastest_block_id,
                 lastest_block_time,
@@ -245,6 +278,7 @@ impl GravityBenchNode {
     /// Helper function to create an OrderedBlock without sending it to pipe_api
     /// Returns (block_number, block_timestamp, ordered_block) if successful
     async fn create_ordered_block(
+        epoch: u64,
         latest_block_number: u64,
         parent_id: B256,
         last_created_block_time: Option<u64>,
@@ -319,7 +353,7 @@ impl GravityBenchNode {
         let tx_count = txs.len();
         // Fetch current epoch from the EpochManager contract
         let ordered_block = OrderedBlock {
-            epoch: 0, // We set epoch before sending to pipe_api
+            epoch,
             parent_id,
             id: block_id,
             number: new_block_number,
@@ -335,7 +369,7 @@ impl GravityBenchNode {
             enable_randomness: false,
         };
         info!(
-            "🔨 [GravityBenchNode] Creating OrderedBlock #{}, {} transactions from gravity_bench_submitBatch, parent_id={:?}, block_id={:?}",
+            "🔨 [GravityBenchNode] Creating OrderedBlock #{}, {} transactions from buffer, parent_id={:?}, block_id={:?}",
             new_block_number,
             tx_count,
             parent_id,
@@ -345,16 +379,14 @@ impl GravityBenchNode {
     }
 
     /// Helper function to send a block from the queue to pipe_api
-    /// Returns (elapsed time in milliseconds, transactions count, queue size)
-    async fn try_send_block_from_queue<EthApi>(
+    /// Returns (elapsed time in milliseconds, block_number, block_timestamp, transactions count, queue size)
+    async fn try_send_block_from_queue(
         pipe_api: &Arc<Mutex<Option<Arc<dyn PipeExecLayerApiTrait>>>>,
-        eth_api: &EthApi,
         block_queue: &Arc<Mutex<VecDeque<OrderedBlock>>>,
-        latest_canonical_block: &Arc<RwLock<Option<u64>>>,
+        latest_executed_block_number: u64,
+        latest_sent_block: &Arc<RwLock<u64>>,
+        current_epoch: &Arc<RwLock<u64>>,
     ) -> (u128, u64, u64, usize, usize)
-    where
-        EthApi: EthCall + Send + Sync + 'static,
-        EthApi::NetworkTypes: RpcTypes<TransactionRequest = TransactionRequest>,
     {
         let first_block_number = {
             let queue = block_queue.lock().await;
@@ -365,15 +397,18 @@ impl GravityBenchNode {
             return (0, 0, 0, 0, 0);
         }
         let first_block_number = first_block_number.unwrap();
-        // Check if we can create send the next blocklet
-        let last_canonical_block = *latest_canonical_block.read().await;
-        let mut canonical_block_number = 0;
-        if last_canonical_block.is_none() && first_block_number > 1 {
-            info!("⏳ [GravityBenchNode] No canonical block available yet for none genesis block, skipping");
+        
+        // Check if we can send the next block
+        // The block number should be exactly latest_executed_block_number + 1
+        // We can only send if the first block in queue is the next block after the latest executed block
+        let expected_block_number = latest_executed_block_number + 1;
+        if first_block_number != expected_block_number {
+            if first_block_number > expected_block_number {
+                info!("⏳ [GravityBenchNode] Try to send block for execution but block number {} is ahead of expected block {} (latest executed: {}), continue to wait", first_block_number, expected_block_number, latest_executed_block_number);
+            } else {
+                debug!("⏳ [GravityBenchNode] Block number {} is behind expected block {} (latest executed: {}), skipping", first_block_number, expected_block_number, latest_executed_block_number);
+            }
             return (0, 0, 0, 0, block_queue.lock().await.len());
-        }
-        if let Some(block_number) = last_canonical_block {
-            canonical_block_number = block_number;
         }
         // Try to pop a block from the queue
         let (ordered_block, queue_size) = {
@@ -383,7 +418,8 @@ impl GravityBenchNode {
         };
 
         // Fetch current epoch from the EpochManager contract
-        let current_epoch = get_current_epoch(eth_api, canonical_block_number).await;
+        // let current_epoch = get_current_epoch(eth_api, latest_executed_block_number).await;
+        let current_epoch = *current_epoch.read().await;
         let mut ordered_block = ordered_block.unwrap();
         ordered_block.epoch = current_epoch;
         let block_number = ordered_block.number;
@@ -399,20 +435,19 @@ impl GravityBenchNode {
         let pipe_api_guard = pipe_api.lock().await;
         if let Some(api) = pipe_api_guard.as_ref() {
             api.push_ordered_block(ordered_block);
+            // Update latest sent block number
+            *latest_sent_block.write().await = block_number;
             info!(
                 "✅ [GravityBenchNode] Successfully injected OrderedBlock #{} into pipe exec layer:
-                    epoch={}, canonical block number={}, {} transactions, block_id={:?}, timestamp={}. Block queue size={}",
+                    epoch={}, latest executed block number={}, {} transactions, block_id={:?}, timestamp={}. Block queue size={}",
                     block_number,
                     current_epoch,
-                    canonical_block_number,                   
+                    latest_executed_block_number,                   
                     tx_count,
                     block_id,
                     block_timestamp,
                     queue_size,
             );
-            // Reset latest canonical block to None after sending block to pipe_api
-            // We must wait for the next canonical block to be committed before sending the next block
-            *latest_canonical_block.write().await = None;
             let current_time = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap()

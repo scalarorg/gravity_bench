@@ -1,4 +1,5 @@
 use alloy_rpc_types_eth::TransactionRequest;
+use gravity_api_types::events::contract_event::GravityEvent;
 use greth::{
     gravity_storage::block_view_storage::BlockViewStorage,
     reth_db::DatabaseEnv,
@@ -8,8 +9,10 @@ use greth::{
     reth_provider::providers::BlockchainProvider,
     reth_rpc_api::eth::{helpers::EthCall, RpcTypes},
 };
+use reth_pipe_exec_layer_ext_v2::ExecutionResult;
 use std::sync::Arc;
-use tracing::info;
+use tokio::sync::mpsc;
+use tracing::{info, warn};
 
 pub type RethBlockChainProvider =
     BlockchainProvider<NodeTypesWithDBAdapter<EthereumNode, Arc<DatabaseEnv>>>;
@@ -33,6 +36,8 @@ pub struct GravityBenchCoordinator<EthApi: RethEthCall> {
     pipe_api: Arc<RethPipeExecLayerApi<EthApi>>,
     provider: RethBlockChainProvider,
     chain_id: u64,
+    /// Channel sender to notify GravityBenchNode when a block execution is complete
+    block_executed_tx: Option<mpsc::UnboundedSender<(u64, Option<u64>)>>,
 }
 
 impl<EthApi: RethEthCall> GravityBenchCoordinator<EthApi> {
@@ -40,11 +45,13 @@ impl<EthApi: RethEthCall> GravityBenchCoordinator<EthApi> {
         pipe_api: Arc<RethPipeExecLayerApi<EthApi>>,
         provider: RethBlockChainProvider,
         chain_id: u64,
+        block_executed_tx: Option<mpsc::UnboundedSender<(u64, Option<u64>)>>,
     ) -> Self {
         Self {
             pipe_api,
             provider,
             chain_id,
+            block_executed_tx,
         }
     }
 
@@ -54,7 +61,13 @@ impl<EthApi: RethEthCall> GravityBenchCoordinator<EthApi> {
     /// This completes the verify_executed_block_hash flow
     pub async fn start_commit_vote(&self) -> Result<(), String> {
         loop {
-            let execution_result = self
+            let ExecutionResult {
+                block_id,
+                block_number,
+                block_hash,
+                txs_info: _,
+                gravity_events,
+            } = self
                 .pipe_api
                 .pull_executed_block_hash()
                 .await
@@ -65,10 +78,6 @@ impl<EthApi: RethEthCall> GravityBenchCoordinator<EthApi> {
             // 1. Receive execution result from pipe exec layer
             // 2. Verify the block hash (in a real system, would re-seal and verify)
             // 3. Send verified hash back to pipe exec layer
-
-            let block_id = execution_result.block_id;
-            let block_hash = execution_result.block_hash;
-            let block_number = execution_result.block_number;
 
             info!(
                 "Verifying executed block: id={:?}, number={}, hash={:?}",
@@ -87,6 +96,25 @@ impl<EthApi: RethEthCall> GravityBenchCoordinator<EthApi> {
                 "Block verified and committed: id={:?}, number={}, hash={:?}",
                 block_id, block_number, block_hash
             );
+
+            // Signal to GravityBenchNode that block execution is complete
+            // This allows immediate sending of the next block instead of waiting for canonical block event
+            if let Some(ref tx) = self.block_executed_tx {
+                let mut new_epoch = None;
+                for gravity_event in gravity_events {
+                    match gravity_event {
+                        GravityEvent::NewEpoch(epoch, _) => {
+                            new_epoch = Some(epoch);
+                        }
+                        _ => {}
+                    }
+                }
+                if let Err(e) = tx.send((block_number, new_epoch)) {
+                    warn!("Failed to send block execution signal: {}", e);
+                } else {
+                    info!("✅ [GravityBenchCoordinator] Signaled block execution complete: block_number={}, new_epoch={:?}", block_number, new_epoch);
+                }
+            }
         }
     }
 
@@ -106,11 +134,14 @@ impl<EthApi: RethEthCall> GravityBenchCoordinator<EthApi> {
         let pipe_api = self.pipe_api.clone();
         let provider = self.provider.clone();
         let chain_id = self.chain_id;
+        let block_executed_tx = self.block_executed_tx.clone();
         tokio::spawn(async move {
+            info!("✅ [GravityBenchCoordinator] Starting commit vote task");
             let coordinator = GravityBenchCoordinator {
                 pipe_api,
                 provider,
                 chain_id,
+                block_executed_tx,
             };
             coordinator.start_commit_vote().await.unwrap();
         });
@@ -120,10 +151,12 @@ impl<EthApi: RethEthCall> GravityBenchCoordinator<EthApi> {
         let provider = self.provider.clone();
         let chain_id = self.chain_id;
         tokio::spawn(async move {
+            info!("✅ [GravityBenchCoordinator] Starting commit task");
             let coordinator = GravityBenchCoordinator {
                 pipe_api,
                 provider,
                 chain_id,
+                block_executed_tx: None,
             };
             coordinator.start_commit().await.unwrap();
         });

@@ -68,6 +68,7 @@ jsonrpsee = { version = "0.26.0", features = ["server", "macros"] }
 # Gravity SDK dependencies for OrderedBlock injection
 alloy-consensus = "1.0"
 greth = { path = "../gravity-reth" }
+gravity-api-types = { package = "api-types", git = "https://github.com/Galxe/gravity-aptos", tag = "gravity-v1.1.0" }
 reth-pipe-exec-layer-ext-v2 = { path = "../gravity-reth/crates/pipe-exec-layer-ext-v2/execute" }
 reth-primitives = { path = "../gravity-reth/crates/primitives" }
 reth-rpc-api = { path = "../gravity-reth/crates/rpc/rpc-api" }

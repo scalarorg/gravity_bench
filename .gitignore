@@ -10,7 +10,6 @@ package-lock.json
 package.json
 node_modules
 deploy.json
-bench_config.toml
 log
 log.log
 *.log
