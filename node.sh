@@ -5,9 +5,11 @@ DATA_DIR="${RETH_DATADIR:-./data}"
 rm -rf $DATA_DIR
 BUILDER_GAS_LIMIT=240000000
 BLOCK_TIME=1s
-BLOCK_MAX_TRANSACTIONS=30000
+BLOCK_MAX_TRANSACTIONS=40000
 BLOCK_INTERVAL_MS=1000
 GRAVITY_PIPE_BLOCK_GAS_LIMIT=5000000000
+GRAVITY_CACHE_MAX_PERSIST_GAP=64
+ENGINE_PERSISTENCE_THRESHOLD=0
 # Default value of pipe block gas limit is 1000000000 => max number of transactions is 16666
 stop() {
     # Stop any existing reth processes before starting
@@ -45,7 +47,9 @@ start() {
     --http.api eth,net,web3,txpool,debug \
     --http.port 8545 \
     --http.addr 0.0.0.0 \
+    --engine.persistence-threshold "$ENGINE_PERSISTENCE_THRESHOLD" \
     --gravity.pipe-block-gas-limit "$GRAVITY_PIPE_BLOCK_GAS_LIMIT" \
+    --gravity.cache.max-persist-gap "$GRAVITY_CACHE_MAX_PERSIST_GAP" \
     --enable-gravity-bench \
     --batch-size $BLOCK_MAX_TRANSACTIONS \
     --block-interval-ms $BLOCK_INTERVAL_MS \

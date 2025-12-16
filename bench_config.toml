@@ -36,7 +36,7 @@ max_pool_size = 1000000
 duration_secs = 600
 # Batch size for batch transaction sending (0 = disabled, use individual sending)
 # Recommended: 500-5000 for optimal performance with eth_sendRawTransactions
-batch_size = 100
+batch_size = 150
 # Batch timeout in milliseconds - send batch even if not full after this timeout
 # Recommended: 50-200ms for low latency, 200-500ms for higher throughput
 batch_timeout_ms = 200

@@ -16,6 +16,8 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
+GRAVITY_RETH_BRANCH="fastevm"
+GRAVITY_BENCH_BRANCH="fastevm"
 # Logging functions
 log_info() {
     echo -e "${GREEN}[INFO]${NC} $1"
@@ -27,22 +29,6 @@ log_warn() {
 
 log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
-}
-
-# Check if NVMe device exists
-check_nvme_device() {
-    if [ ! -e "$NVME_DEVICE" ]; then
-        log_warn "NVMe device $NVME_DEVICE not found. Skipping NVMe setup."
-        return 1
-    fi
-    
-    if [ ! -b "$NVME_DEVICE" ]; then
-        log_error "$NVME_DEVICE exists but is not a block device."
-        return 1
-    fi
-    
-    log_info "NVMe device $NVME_DEVICE found."
-    return 0
 }
 
 # Setup NVMe disk
@@ -100,6 +86,7 @@ install_system_dependencies() {
         libssl-dev \
         htop \
         git \
+        rsync \
         python3 \
         python3-pip \
         python3-dev \
@@ -169,7 +156,7 @@ clone_repositories() {
     
     if [ ! -d "gravity_bench" ]; then
         log_info "Cloning gravity_bench repository..."
-        git clone https://github.com/scalarorg/gravity_bench.git -b fastevm
+        git clone https://github.com/scalarorg/gravity_bench.git -b ${GRAVITY_RETH_BRANCH}
     else
         log_warn "gravity_bench directory already exists. Skipping clone."
     fi
@@ -209,14 +196,7 @@ main() {
     log_info "Starting gravity_bench setup..."
     
     # Setup NVMe if available
-    # if check_nvme_device; then
-    #     setup_nvme
-    # else
-    #     log_warn "Continuing without NVMe setup. Using default locations."
-    #     MOUNT_POINT="$HOME"
-    #     BENCH_DIR="$HOME/gravity_bench"
-    # fi
-    
+    setup_nvme
     # Install dependencies
     install_system_dependencies
     install_nodejs
