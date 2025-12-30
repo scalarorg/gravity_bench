@@ -196,7 +196,7 @@ main() {
     log_info "Starting gravity_bench setup..."
     
     # Setup NVMe if available
-    setup_nvme
+    # setup_nvme
     # Install dependencies
     install_system_dependencies
     install_nodejs

@@ -2,7 +2,7 @@
 
 # Uniswap configuration file path
 contract_config_path = "deploy.json"
-target_tps = 30000
+target_tps = 10000
 nodes = [
     { rpc_url = "http://localhost:8545", chain_id = 1337 },
 ]
@@ -29,17 +29,17 @@ num_accounts = 100000
 # Performance and stress configuration
 [performance]
 # Number of concurrent transaction sending tasks inside TxnConsumer
-num_senders = 2000
+num_senders = 200
 # Maximum capacity of the transaction pool inside Consumer
 max_pool_size = 1000000
 # Duration of the benchmark in seconds. Set to 0 to run indefinitely.
-duration_secs = 600
+duration_secs = 0
 # Batch size for batch transaction sending (0 = disabled, use individual sending)
 # Recommended: 500-5000 for optimal performance with eth_sendRawTransactions
-batch_size = 150
+batch_size = 5
 # Batch timeout in milliseconds - send batch even if not full after this timeout
 # Recommended: 50-200ms for low latency, 200-500ms for higher throughput
-batch_timeout_ms = 200
+batch_timeout_ms = 500
 # Injection mode: "mempool" (via eth_sendRawTransactions) or "ordered_block" (via gravity_bench_submitBatch)
 # - "mempool": Transactions go through normal RPC to transaction pool (default)
 # - "ordered_block": Transactions bypass transaction pool and go directly to execution via OrderedBlock injection
