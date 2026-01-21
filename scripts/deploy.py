@@ -119,7 +119,44 @@ def send_transaction(w3, tx, private_key, description):
         print(f"  ❌ Exception during '{description}' transaction: {e}")
         return None
 
-def deploy_contract(w3, account, private_key, contract_interface, contract_name, *args):
+def send_transaction_fastevm(w3, tx, private_key, description):
+    """Signs and sends a transaction via rawtx_sendRawTransactionAsync (FastEVM client)."""
+    try:
+        signed_tx = w3.eth.account.sign_transaction(tx, private_key=private_key)
+        # Convert raw transaction bytes to array of integers
+        # The RPC expects Bytes = Vec<u8>, which jsonrpsee serializes as an array of integers
+        # e.g., [249, 14, 216, 128, ...] instead of "0xf90ed880..."
+        tx_bytes_array = list(signed_tx.raw_transaction)
+        
+        # Call rawtx_sendRawTransactionAsync RPC method
+        # Note: This is async, so it may not return a hash immediately
+        # We compute the hash from the transaction bytes (keccak256 of RLP-encoded transaction)
+        # The method expects: rawtx_sendRawTransactionAsync(bytes: Vec<u8>)
+        # Vec<u8> is serialized as an array of integers in JSON-RPC
+        params = [tx_bytes_array]
+        
+        # Use make_request directly to ensure proper formatting
+        result = w3.manager.request_blocking("rawtx_sendRawTransactionAsync", params)
+        
+        # Compute transaction hash from RLP-encoded bytes
+        # The hash is computed as keccak256 of the RLP-encoded transaction
+        # Use web3's keccak function
+        tx_hash = w3.keccak(signed_tx.raw_transaction).hex()
+        
+        print(f"  > {description} transaction sent via rawtx_sendRawTransactionAsync, TX Hash: {tx_hash}")
+        tx_receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
+        if tx_receipt['status'] == 0:
+            print(f"  ❌ {description} transaction FAILED.")
+            return None
+        print(f"  ✅ {description} transaction successful.")
+        return tx_receipt
+    except Exception as e:
+        print(f"  ❌ Exception during '{description}' transaction (rawtx_sendRawTransactionAsync): {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+def deploy_contract(w3, account, private_key, contract_interface, contract_name, send_tx_func, *args):
     """A generic contract deployment function."""
     print(f"Deploying {contract_name}...")
     Contract = w3.eth.contract(abi=contract_interface['abi'], bytecode=contract_interface['bin'])
@@ -137,14 +174,14 @@ def deploy_contract(w3, account, private_key, contract_interface, contract_name,
         'gas': gas_limit, 'gasPrice': gas_price
     })
     
-    receipt = send_transaction(w3, tx, private_key, f"Deploy {contract_name}")
+    receipt = send_tx_func(w3, tx, private_key, f"Deploy {contract_name}")
     if not receipt: return None, None
     
     address = receipt['contractAddress']
     print(f"✅ {contract_name} deployed to: {address}")
     return address, w3.eth.contract(address=address, abi=contract_interface['abi'])
 
-def approve_token(w3, account, private_key, token_contract, spender_address, token_symbol):
+def approve_token(w3, account, private_key, token_contract, spender_address, token_symbol, send_tx_func):
     """Approves a token for a spender (e.g., the Router)."""
     print(f"Approving {token_symbol} for the Router...")
     amount = 2**256 - 1  # Max approval
@@ -160,9 +197,9 @@ def approve_token(w3, account, private_key, token_contract, spender_address, tok
         'gasPrice': w3.eth.gas_price
     })
     
-    return send_transaction(w3, tx, private_key, f"Approve {token_symbol}") is not None
+    return send_tx_func(w3, tx, private_key, f"Approve {token_symbol}") is not None
 
-def add_liquidity(w3, account, private_key, router_contract, token_a_info, token_b_info):
+def add_liquidity(w3, account, private_key, router_contract, token_a_info, token_b_info, send_tx_func):
     """Adds liquidity for a pair of ERC20 tokens."""
     token_a_addr, token_a_sym = token_a_info['address'], token_a_info['symbol']
     token_b_addr, token_b_sym = token_b_info['address'], token_b_info['symbol']
@@ -180,10 +217,10 @@ def add_liquidity(w3, account, private_key, router_contract, token_a_info, token
         'gas': 3_000_000, 'gasPrice': w3.eth.gas_price
     })
     
-    receipt = send_transaction(w3, tx, private_key, f"Add Liquidity for {pair_name}")
+    receipt = send_tx_func(w3, tx, private_key, f"Add Liquidity for {pair_name}")
     return receipt is not None
 
-def add_liquidity_eth(w3, account, private_key, router_contract, token_info):
+def add_liquidity_eth(w3, account, private_key, router_contract, token_info, send_tx_func):
     """Adds liquidity for ETH and an ERC20 token."""
     token_addr, token_sym = token_info['address'], token_info['symbol']
     pair_name = f"{token_sym}/ETH"
@@ -201,7 +238,7 @@ def add_liquidity_eth(w3, account, private_key, router_contract, token_info):
         'gas': 3_000_000, 'gasPrice': w3.eth.gas_price
     })
     
-    receipt = send_transaction(w3, tx, private_key, f"Add Liquidity for {pair_name}")
+    receipt = send_tx_func(w3, tx, private_key, f"Add Liquidity for {pair_name}")
     return receipt is not None
 
 # --- 3. Main Execution Logic ---
@@ -211,6 +248,15 @@ def main(args):
     # --- Initialization ---
     w3 = Web3(Web3.HTTPProvider(args.rpc_url))
     account = w3.eth.account.from_key(args.private_key)
+    
+    # Select transaction sending method based on client_type
+    if args.client_type == "fastevm":
+        send_tx_func = send_transaction_fastevm
+        print(f"Using FastEVM client (rawtx_sendRawTransactionAsync)")
+    else:
+        send_tx_func = send_transaction
+        print(f"Using standard ETH client (eth_sendRawTransaction)")
+    
     print(f"Connected to: {args.rpc_url}")
     print(f"Deployer address: {account.address}")
     print(f"ETH Balance: {w3.from_wei(w3.eth.get_balance(account.address), 'ether'):.4f} ETH")
@@ -228,9 +274,9 @@ def main(args):
     if args.enable_swap_token:
         # --- Deploy Core Contracts (Factory, WETH, Router) ---
         print("\n--- Deploying Uniswap V2 & WETH Core Contracts ---")
-        factory_address, factory_contract = deploy_contract(w3, account, args.private_key, contracts['factory'], "UniswapV2Factory", account.address)
-        weth_address, _ = deploy_contract(w3, account, args.private_key, contracts['weth'], "WETH9")
-        router_address, router_contract = deploy_contract(w3, account, args.private_key, contracts['router'], "UniswapV2Router02", factory_address, weth_address)
+        factory_address, factory_contract = deploy_contract(w3, account, args.private_key, contracts['factory'], "UniswapV2Factory", send_tx_func, account.address)
+        weth_address, _ = deploy_contract(w3, account, args.private_key, contracts['weth'], "WETH9", send_tx_func)
+        router_address, router_contract = deploy_contract(w3, account, args.private_key, contracts['router'], "UniswapV2Router02", send_tx_func, factory_address, weth_address)
         
         if not all([factory_address, weth_address, router_address]):
             raise Exception("Core contract deployment failed. Exiting.")
@@ -242,7 +288,7 @@ def main(args):
     for i in range(args.num_tokens):
         token_name = f"MyToken{i+1}"
         token_symbol = f"TKN{i+1}"
-        addr, contract = deploy_contract(w3, account, args.private_key, contracts['token'], token_name, token_name, token_symbol, initial_supply)
+        addr, contract = deploy_contract(w3, account, args.private_key, contracts['token'], token_name, send_tx_func, token_name, token_symbol, initial_supply)
         if addr:
             deployed_tokens.append({'symbol': token_symbol, 'address': addr, 'contract': contract})
             
@@ -255,8 +301,8 @@ def main(args):
         
         # 1. Create Token/ETH pools for all tokens
         for token_info in deployed_tokens:
-            if approve_token(w3, account, args.private_key, token_info['contract'], router_address, token_info['symbol']):
-                if add_liquidity_eth(w3, account, args.private_key, router_contract, token_info):
+            if approve_token(w3, account, args.private_key, token_info['contract'], router_address, token_info['symbol'], send_tx_func):
+                if add_liquidity_eth(w3, account, args.private_key, router_contract, token_info, send_tx_func):
                     pair_addr = factory_contract.functions.getPair(token_info['address'], weth_address).call()
                     liquidity_eth_pairs.append({
                         "token_a_symbol": token_info['symbol'],
@@ -277,11 +323,11 @@ def main(args):
             token_b = deployed_tokens[i+1]
             
             # Approve both tokens for the router
-            approve_a = approve_token(w3, account, args.private_key, token_a['contract'], router_address, token_a['symbol'])
-            approve_b = approve_token(w3, account, args.private_key, token_b['contract'], router_address, token_b['symbol'])
+            approve_a = approve_token(w3, account, args.private_key, token_a['contract'], router_address, token_a['symbol'], send_tx_func)
+            approve_b = approve_token(w3, account, args.private_key, token_b['contract'], router_address, token_b['symbol'], send_tx_func)
             
             if approve_a and approve_b:
-                if add_liquidity(w3, account, args.private_key, router_contract, token_a, token_b):
+                if add_liquidity(w3, account, args.private_key, router_contract, token_a, token_b, send_tx_func):
                     pair_addr = factory_contract.functions.getPair(token_a['address'], token_b['address']).call()
                     liquidity_token_pairs.append({
                         "token_a_symbol": token_a['symbol'],
@@ -341,6 +387,8 @@ if __name__ == "__main__":
     parser.add_argument('--rpc-url', default='http://localhost:8545', help='RPC URL of the Ethereum node.')
     parser.add_argument('--output-file', default='deploy.json', help='File path to save the JSON output.')
     parser.add_argument('--enable-swap-token', action='store_true', help='If set, deploys Uniswap contracts and creates liquidity pools.')
+    parser.add_argument('--client-type', default='eth', choices=['eth', 'fastevm'], 
+                        help='Client type to use for sending transactions: "eth" (standard eth_sendRawTransaction) or "fastevm" (rawtx_sendRawTransactionAsync). Default: "eth".')
 
     args = parser.parse_args()
     main(args)

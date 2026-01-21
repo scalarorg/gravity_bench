@@ -23,7 +23,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 use crate::{
     actors::{consumer::Consumer, producer::Producer, Monitor, RegisterTxnPlan},
     config::{BenchConfig, ContractConfig},
-    eth::EthHttpCli,
+    eth::{EthHttpCli, FastEvmCli},
     txn_plan::{
         addr_pool::AddressPool,
         constructor::FaucetTreePlanBuilder,
@@ -41,6 +41,13 @@ struct Args {
 
     #[arg(long, default_value = "bench_config.toml")]
     config: String,
+
+    #[arg(
+        long,
+        default_value = "info",
+        help = "Set the log level (trace, debug, info, warn, error)"
+    )]
+    log_level: String,
 }
 
 // mod uniswap;
@@ -262,8 +269,7 @@ async fn start_bench() -> Result<()> {
 
     // Initialize tracing
     let log_path = benchmark_config.log_path.trim();
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     let _guard = if log_path.is_empty() || log_path.eq_ignore_ascii_case("console") {
         // Console only
@@ -278,14 +284,23 @@ async fn start_bench() -> Result<()> {
         // File logging
         let path = std::path::Path::new(log_path);
         let directory = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-        let file_stem = path.file_stem().unwrap_or_else(|| std::ffi::OsStr::new("gravity_bench"));
-        let extension = path.extension().unwrap_or_else(|| std::ffi::OsStr::new("log"));
-        
+        let file_stem = path
+            .file_stem()
+            .unwrap_or_else(|| std::ffi::OsStr::new("gravity_bench"));
+        let extension = path
+            .extension()
+            .unwrap_or_else(|| std::ffi::OsStr::new("log"));
+
         // Ensure directory exists
         std::fs::create_dir_all(directory).unwrap();
 
         let timestamp = chrono::Local::now().format("%Y-%m-%d-%H-%M-%S").to_string();
-        let new_filename = format!("{}.{}.{}", file_stem.to_string_lossy(), timestamp, extension.to_string_lossy());
+        let new_filename = format!(
+            "{}.{}.{}",
+            file_stem.to_string_lossy(),
+            timestamp,
+            extension.to_string_lossy()
+        );
         let full_path = directory.join(new_filename);
 
         let file = std::fs::File::create(&full_path).unwrap();
@@ -296,10 +311,10 @@ async fn start_bench() -> Result<()> {
             .with(
                 tracing_subscriber::fmt::layer()
                     .with_writer(non_blocking)
-                    .with_ansi(false)
+                    .with_ansi(false),
             )
             .init();
-        
+
         println!("Logging to file: {:?}", full_path);
         Some(guard)
     };
@@ -312,11 +327,12 @@ async fn start_bench() -> Result<()> {
     } else {
         info!("Starting in normal mode...");
         let mut command = format!(
-            "python scripts/deploy.py --private-key \"{}\" --num-tokens {} --output-file \"{}\" --rpc-url \"{}\"",
+            "python scripts/deploy.py --private-key \"{}\" --num-tokens {} --output-file \"{}\" --rpc-url \"{}\" --client-type \"{}\"",
             benchmark_config.faucet.private_key,
             benchmark_config.num_tokens,
             benchmark_config.contract_config_path,
-            benchmark_config.nodes[0].rpc_url
+            benchmark_config.nodes[0].rpc_url,
+            benchmark_config.client_type
         );
         if benchmark_config.enable_swap_token {
             command.push_str(" --enable-swap-token");
@@ -343,17 +359,43 @@ async fn start_bench() -> Result<()> {
             .map(|&id| Arc::new(accout_generator.get_address_by_id(id)))
             .collect::<Vec<_>>()
     });
-    // Create EthHttpCli instance
-    let eth_clients: Vec<Arc<EthHttpCli>> = benchmark_config
-        .nodes
-        .iter()
-        .map(|node| {
-            let client = EthHttpCli::new(&node.rpc_url, node.chain_id).unwrap();
-            Arc::new(client)
-        })
-        .collect();
-
     let chain_id = benchmark_config.nodes[0].chain_id;
+    let client_type = benchmark_config.client_type.to_lowercase();
+    info!("📋 Configuration: client_type = '{}'", client_type);
+
+    // Create clients based on client_type configuration
+    let (eth_clients, fastevm_clients) = if client_type == "fastevm" {
+        info!("✅ Using FastEVM client with rawtx RPC endpoints (rawtx_sendRawTransactionAsync, rawtx_sendRawTransactionsAsync)");
+        let fastevm_clients: Vec<FastEvmCli> = benchmark_config
+            .nodes
+            .iter()
+            .map(|node| {
+                info!("Creating FastEVM client for: {}", node.rpc_url);
+                FastEvmCli::new(&node.rpc_url, node.chain_id).unwrap()
+            })
+            .collect();
+        // Create EthHttpCli instances for nonce queries and other standard operations (NOT for sending transactions)
+        let eth_clients: Vec<Arc<EthHttpCli>> = benchmark_config
+            .nodes
+            .iter()
+            .map(|node| {
+                let client = EthHttpCli::new(&node.rpc_url, node.chain_id).unwrap();
+                Arc::new(client)
+            })
+            .collect();
+        (eth_clients, Some(fastevm_clients))
+    } else {
+        info!("✅ Using standard ETH client with eth RPC endpoints (eth_sendRawTransaction, gravity_submitBatch)");
+        let eth_clients: Vec<Arc<EthHttpCli>> = benchmark_config
+            .nodes
+            .iter()
+            .map(|node| {
+                let client = EthHttpCli::new(&node.rpc_url, node.chain_id).unwrap();
+                Arc::new(client)
+            })
+            .collect();
+        (eth_clients, None)
+    };
 
     info!("Initializing Faucet constructor...");
     let mut start_nonce = contract_config.get_all_token().len() as u64;
@@ -426,20 +468,42 @@ async fn start_bench() -> Result<()> {
         }
     };
 
-    // Use the same client instances for Consumer to share metrics
-    let eth_providers: Vec<EthHttpCli> = eth_clients
-        .iter()
-        .map(|client| (**client).clone()) // Clone the actual EthHttpCli instead of creating new ones
-        .collect();
-
-    let consumer = Consumer::new_with_providers(
-        eth_providers,
-        benchmark_config.performance.num_senders,
-        monitor.clone(),
-        benchmark_config.performance.max_pool_size,
-        Some(benchmark_config.target_tps as u32),
-    )
-    .start();
+    // Create consumer with appropriate client type
+    let consumer = if client_type == "fastevm" {
+        let fastevm_providers =
+            fastevm_clients.expect("FastEVM clients should be created when client_type='fastevm'");
+        info!(
+            "Creating Consumer with {} FastEVM providers",
+            fastevm_providers.len()
+        );
+        Consumer::new_with_fastevm_providers(
+            fastevm_providers,
+            benchmark_config.performance.num_senders,
+            monitor.clone(),
+            benchmark_config.performance.max_pool_size,
+            Some(benchmark_config.target_tps as u32),
+            benchmark_config.performance.batch_size,
+            benchmark_config.performance.batch_timeout_ms,
+        )
+        .start()
+    } else {
+        info!("Creating Consumer with {} ETH providers", eth_clients.len());
+        // Use the same client instances for Consumer to share metrics
+        let eth_providers: Vec<EthHttpCli> = eth_clients
+            .iter()
+            .map(|client| (**client).clone()) // Clone the actual EthHttpCli instead of creating new ones
+            .collect();
+        Consumer::new_with_eth_providers(
+            eth_providers,
+            benchmark_config.performance.num_senders,
+            monitor.clone(),
+            benchmark_config.performance.max_pool_size,
+            Some(benchmark_config.target_tps as u32),
+            benchmark_config.performance.batch_size,
+            benchmark_config.performance.batch_timeout_ms,
+        )
+        .start()
+    };
     let init_nonce_map = get_init_nonce_map(
         account_manager.clone(),
         benchmark_config.faucet.private_key.as_str(),

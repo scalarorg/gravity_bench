@@ -6,11 +6,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use actix::{Actor, Addr, AsyncContext, Context, Handler, ResponseFuture};
-use alloy::primitives::keccak256;
-use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
-use tracing::{debug, error, info, warn};
-
 use crate::{
     actors::{
         consumer::dispatcher::{Dispatcher, SimpleDispatcher},
@@ -20,6 +15,10 @@ use crate::{
     eth::EthHttpCli,
     txn_plan::SignedTxnWithMetadata,
 };
+use actix::{Actor, Addr, AsyncContext, Context, Handler, ResponseFuture};
+use alloy::primitives::keccak256;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+use tracing::{debug, error, info, warn};
 
 // --- New: Retry configuration constants ---
 /// Maximum retry attempts
@@ -149,6 +148,10 @@ pub struct Consumer {
     pool_receiver: Option<mpsc::Receiver<SignedTxnWithMetadata>>,
     /// Pool maximum capacity
     max_pool_size: usize,
+    /// Batch size for batch transaction sending (0 = disabled)
+    batch_size: usize,
+    /// Batch timeout in milliseconds
+    batch_timeout_ms: u64,
 }
 
 /// Consumer statistics
@@ -170,6 +173,8 @@ impl Consumer {
         monitor_addr: Addr<Monitor>,
         max_pool_size: usize,
         max_tps: Option<u32>,
+        batch_size: usize,
+        batch_timeout_ms: u64,
     ) -> Self {
         let (pool_sender, pool_receiver) = mpsc::channel(max_pool_size);
         let rate_limiter = match max_tps {
@@ -186,7 +191,165 @@ impl Consumer {
             pool_sender,
             pool_receiver: Some(pool_receiver),
             max_pool_size,
+            batch_size,
+            batch_timeout_ms,
         }
+    }
+
+    /// [Refactored Core] Handle batch transaction sending with retry logic
+    async fn process_batch(
+        _permit: OwnedSemaphorePermit,
+        signed_txns: Vec<SignedTxnWithMetadata>,
+        dispatcher: Arc<dyn Dispatcher>,
+        monitor_addr: Addr<Monitor>,
+        transactions_sent: Arc<AtomicU64>,
+        transactions_sending: Arc<AtomicU64>,
+    ) {
+        if signed_txns.is_empty() {
+            return;
+        }
+
+        let batch_size = signed_txns.len();
+        debug!("Processing batch of {} transactions", batch_size);
+        transactions_sending.fetch_add(batch_size as u64, Ordering::Relaxed);
+
+        // Prepare batch data: (tx_bytes, txn_id)
+        let batch_data: Vec<(Vec<u8>, uuid::Uuid)> = signed_txns
+            .iter()
+            .map(|txn| (txn.bytes.clone(), txn.metadata.txn_id))
+            .collect();
+
+        let mut last_error: Option<anyhow::Error> = None;
+
+        // Transaction batch sending retry loop
+        for attempt in 1..=MAX_RETRIES {
+            tracing::debug!(
+                "Attempt {}/{} to send batch of {} transactions",
+                attempt,
+                MAX_RETRIES,
+                batch_size
+            );
+            match dispatcher.send_txs(batch_data.clone()).await {
+                // Batch sent successfully
+                Ok(results) => {
+                    debug!(
+                        "Batch of {} transactions sent successfully on attempt {}",
+                        batch_size, attempt
+                    );
+                    // Update monitor for each transaction
+                    for (i, signed_txn) in signed_txns.iter().enumerate() {
+                        if i < results.len() {
+                            let (tx_hash, rpc_url) = &results[i];
+                            monitor_addr.do_send(UpdateSubmissionResult {
+                                metadata: signed_txn.metadata.clone(),
+                                result: Arc::new(SubmissionResult::Success(*tx_hash)),
+                                rpc_url: rpc_url.clone(),
+                                send_time: Instant::now(),
+                                signed_bytes: Arc::new(signed_txn.bytes.clone()),
+                            });
+                        } else {
+                            // If we got fewer results than expected, mark remaining as errors
+                            warn!(
+                                "Batch result count mismatch: expected {}, got {}",
+                                batch_size,
+                                results.len()
+                            );
+                            monitor_addr.do_send(UpdateSubmissionResult {
+                                metadata: signed_txn.metadata.clone(),
+                                result: Arc::new(SubmissionResult::ErrorWithRetry),
+                                rpc_url: "unknown".to_string(),
+                                send_time: Instant::now(),
+                                signed_bytes: Arc::new(signed_txn.bytes.clone()),
+                            });
+                        }
+                    }
+
+                    // Update statistics and return
+                    transactions_sending.fetch_sub(batch_size as u64, Ordering::Relaxed);
+                    transactions_sent.fetch_add(batch_size as u64, Ordering::Relaxed);
+                    return;
+                }
+                // Batch sending failed, enter error handling and retry logic
+                Err((e, url)) => {
+                    let error_string = e.to_string().to_lowercase();
+
+                    // Handle underpriced error - treat as success
+                    if error_string.contains("underpriced") {
+                        debug!("Batch underpriced error, treating as success");
+                        for signed_txn in &signed_txns {
+                            let tx_hash = keccak256(&signed_txn.bytes);
+                            monitor_addr.do_send(UpdateSubmissionResult {
+                                metadata: signed_txn.metadata.clone(),
+                                result: Arc::new(SubmissionResult::Success(tx_hash)),
+                                rpc_url: url.clone(),
+                                send_time: Instant::now(),
+                                signed_bytes: Arc::new(signed_txn.bytes.clone()),
+                            });
+                        }
+                        transactions_sending.fetch_sub(batch_size as u64, Ordering::Relaxed);
+                        transactions_sent.fetch_add(batch_size as u64, Ordering::Relaxed);
+                        return;
+                    }
+
+                    // Handle nonce errors - check each transaction individually
+                    if error_string.contains("nonce too low")
+                        || error_string.contains("invalid nonce")
+                    {
+                        warn!("Batch nonce error, checking individual transactions");
+                        for signed_txn in &signed_txns {
+                            if let Ok(next_nonce) = dispatcher
+                                .get_txn_count(&url, *signed_txn.metadata.from_account.as_ref())
+                                .await
+                            {
+                                if next_nonce > signed_txn.metadata.nonce {
+                                    monitor_addr.do_send(UpdateSubmissionResult {
+                                        metadata: signed_txn.metadata.clone(),
+                                        result: Arc::new(SubmissionResult::NonceTooLow {
+                                            tx_hash: keccak256(&signed_txn.bytes),
+                                            expect_nonce: next_nonce,
+                                            actual_nonce: signed_txn.metadata.nonce,
+                                            from_account: signed_txn.metadata.from_account.clone(),
+                                        }),
+                                        rpc_url: url.clone(),
+                                        send_time: Instant::now(),
+                                        signed_bytes: Arc::new(signed_txn.bytes.clone()),
+                                    });
+                                }
+                            }
+                        }
+                        transactions_sending.fetch_sub(batch_size as u64, Ordering::Relaxed);
+                        return;
+                    }
+
+                    last_error = Some(e);
+
+                    // If not the last attempt, wait then retry
+                    if attempt < MAX_RETRIES {
+                        tokio::time::sleep(RETRY_DELAY).await;
+                    }
+                }
+            }
+        }
+
+        // Final handling after all retries failed
+        error!(
+            "Batch of {} transactions failed after {} retries. Last error: {:?}",
+            batch_size,
+            MAX_RETRIES,
+            last_error.map(|e| e.to_string())
+        );
+
+        for signed_txn in &signed_txns {
+            monitor_addr.do_send(UpdateSubmissionResult {
+                metadata: signed_txn.metadata.clone(),
+                result: Arc::new(SubmissionResult::ErrorWithRetry),
+                rpc_url: "unknown".to_string(),
+                send_time: Instant::now(),
+                signed_bytes: Arc::new(signed_txn.bytes.clone()),
+            });
+        }
+
+        transactions_sending.fetch_sub(batch_size as u64, Ordering::Relaxed);
     }
 
     /// [Refactored Core] Handle single transaction sending with retry logic
@@ -290,10 +453,7 @@ impl Consumer {
                     {
                         // Check current on-chain nonce to determine final state
                         if let Ok(next_nonce) = dispatcher
-                            .provider(&url)
-                            .await
-                            .unwrap()
-                            .get_txn_count(metadata.from_account.as_ref().clone())
+                            .get_txn_count(&url, metadata.from_account.as_ref().clone())
                             .await
                         {
                             // If on-chain nonce is greater than our attempted nonce, our transaction is indeed outdated
@@ -362,21 +522,47 @@ impl Consumer {
         transactions_sending.fetch_sub(1, Ordering::Relaxed);
     }
 
-    /// Create new TxnConsumer instance (convenience method, using SimpleDispatcher)
-    pub fn new_with_providers(
+    /// Create new TxnConsumer instance (convenience method, using SimpleDispatcher with EthHttpCli)
+    pub fn new_with_eth_providers(
         providers: Vec<EthHttpCli>,
         max_concurrent_senders: usize,
         monitor_addr: Addr<Monitor>,
         max_pool_size: usize,
         max_tps: Option<u32>,
+        batch_size: usize,
+        batch_timeout_ms: u64,
     ) -> Consumer {
-        let dispatcher = Arc::new(SimpleDispatcher::new(providers));
+        let dispatcher = Arc::new(SimpleDispatcher::new_eth(providers));
         Consumer::new(
             dispatcher,
             max_concurrent_senders,
             monitor_addr,
             max_pool_size,
             max_tps,
+            batch_size,
+            batch_timeout_ms,
+        )
+    }
+
+    /// Create new TxnConsumer instance (convenience method, using SimpleDispatcher with FastEvmCli)
+    pub fn new_with_fastevm_providers(
+        providers: Vec<crate::eth::FastEvmCli>,
+        max_concurrent_senders: usize,
+        monitor_addr: Addr<Monitor>,
+        max_pool_size: usize,
+        max_tps: Option<u32>,
+        batch_size: usize,
+        batch_timeout_ms: u64,
+    ) -> Consumer {
+        let dispatcher = Arc::new(SimpleDispatcher::new_fastevm(providers));
+        Consumer::new(
+            dispatcher,
+            max_concurrent_senders,
+            monitor_addr,
+            max_pool_size,
+            max_tps,
+            batch_size,
+            batch_timeout_ms,
         )
     }
 
@@ -393,6 +579,8 @@ impl Consumer {
         let transactions_sending = self.stats.transactions_sending.clone();
         let rate_limiter = self.rate_limiter.clone();
         let rate_limited_count = self.stats.transactions_rate_limited.clone();
+        let batch_size = self.batch_size;
+        let batch_timeout_ms = self.batch_timeout_ms;
 
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
@@ -400,6 +588,13 @@ impl Consumer {
                 info!("Transaction pool consumer started with JoinSet and rate limiting (max_tps: {}).", 
                       if rate_limiter.max_tps == 0 { "unlimited".to_string() } else { rate_limiter.max_tps.to_string() });
                 let mut in_flight_tasks = tokio::task::JoinSet::new();
+                
+                // Transaction buffer for batching
+                let mut tx_buffer: Vec<SignedTxnWithMetadata> = Vec::new();
+                let mut buffer_first_txn_time: Option<Instant> = None;
+                let batch_timeout = Duration::from_millis(batch_timeout_ms);
+                // Threshold: if buffer is below this, check timeout
+                let buffer_threshold = if batch_size > 0 { batch_size } else { 1 };
 
                 loop {
                     tokio::select! {
@@ -412,10 +607,50 @@ impl Consumer {
                             }
                         }
 
-                        // Branch 2: Received a new transaction from the pool
+                        // Branch 2: Check timeout for buffer if it's below threshold
+                        _ = tokio::time::sleep(Duration::from_millis(batch_timeout_ms)), if !tx_buffer.is_empty() => {
+                            if let Some(first_time) = buffer_first_txn_time {
+                                if first_time.elapsed() >= batch_timeout {
+                                    debug!("Buffer timeout reached ({}ms), processing {} buffered transactions", batch_timeout_ms, tx_buffer.len());
+                                    
+                                    // Process buffer
+                                    // let current_phase = Phase::from_u8(phase.load(Ordering::Relaxed));                                    
+                                 
+                                    // Process as batch
+                                    let batch = tx_buffer.drain(..).collect::<Vec<_>>();
+                                    buffer_first_txn_time = None;
+                                    
+                                    let dispatcher_clone = dispatcher.clone();
+                                    let monitor_addr_clone = monitor_addr.clone();
+                                    let transactions_sent_clone = transactions_sent.clone();
+                                    let transactions_sending_clone = transactions_sending.clone();
+                                    let semaphore_clone = semaphore.clone();
+                                    
+                                    in_flight_tasks.spawn(async move {
+                                        let permit = match semaphore_clone.acquire_owned().await {
+                                            Ok(permit) => permit,
+                                            Err(_) => {
+                                                error!("Semaphore has been closed, cannot process batch.");
+                                                return;
+                                            }
+                                        };
+                                        Self::process_batch(
+                                            permit,
+                                            batch,
+                                            dispatcher_clone,
+                                            monitor_addr_clone,
+                                            transactions_sent_clone,
+                                            transactions_sending_clone,
+                                        ).await;
+                                    });                                    
+                                }
+                            }
+                        }
+
+                        // Branch 3: Received a new transaction from the pool
                         Some(signed_txn) = pool_receiver.recv() => {
                             pool_size.fetch_sub(1, Ordering::Relaxed);
-                            debug!("Processing txn {:?}, pool size is now {}", signed_txn.metadata.txn_id, pool_size.load(Ordering::Relaxed));
+                            debug!("Received txn {:?}, pool size is now {}", signed_txn.metadata.txn_id, pool_size.load(Ordering::Relaxed));
 
                             // --- NEW: Rate limiting logic ---
                             if !rate_limiter.try_acquire() {
@@ -439,7 +674,7 @@ impl Consumer {
                                 Err(_) => {
                                     error!("Semaphore has been closed, stopping consumer loop.");
                                     monitor_addr.do_send(UpdateSubmissionResult {
-                                        metadata: signed_txn.metadata.clone(),
+                                        metadata: signed_txn.metadata,
                                         result: Arc::new(SubmissionResult::ErrorWithRetry),
                                         rpc_url: "unknown".to_string(),
                                         send_time: Instant::now(),
@@ -460,8 +695,52 @@ impl Consumer {
                             ));
                         }
 
-                        // Branch 3: Transaction pool is closed and all flying tasks are completed
+                        // Branch 4: Transaction pool is closed, process remaining buffer
                         else => {
+                            // Process any remaining buffered transactions
+                            if !tx_buffer.is_empty() {
+                                info!("Processing {} remaining buffered transactions before shutdown", tx_buffer.len());
+                                
+                                // let current_phase = Phase::from_u8(phase.load(Ordering::Relaxed));
+                                
+                                if tx_buffer.len() > 1 {
+                                    // Process as batch
+                                    let batch = tx_buffer.drain(..).collect::<Vec<_>>();
+                                    buffer_first_txn_time = None;
+                                    
+                                    let dispatcher_clone = dispatcher.clone();
+                                    let monitor_addr_clone = monitor_addr.clone();
+                                    let transactions_sent_clone = transactions_sent.clone();
+                                    let transactions_sending_clone = transactions_sending.clone();
+                                    let semaphore_clone = semaphore.clone();
+                                    
+                                    in_flight_tasks.spawn(async move {
+                                        let permit = match semaphore_clone.acquire_owned().await {
+                                            Ok(permit) => permit,
+                                            Err(_) => {
+                                                error!("Semaphore has been closed, cannot process batch.");
+                                                return;
+                                            }
+                                        };
+                                        Self::process_batch(
+                                            permit,
+                                            batch,
+                                            dispatcher_clone,
+                                            monitor_addr_clone,
+                                            transactions_sent_clone,
+                                            transactions_sending_clone,
+                                        ).await;
+                                    });
+                                } 
+                            }
+                            
+                            // Wait for all in-flight tasks to complete
+                            while let Some(result) = in_flight_tasks.join_next().await {
+                                if let Err(e) = result {
+                                    error!("A transaction processing task panicked or was cancelled: {:?}", e);
+                                }
+                            }
+                            
                             info!("Transaction pool closed and all in-flight tasks finished.");
                             break;
                         }
@@ -498,12 +777,9 @@ impl Actor for Consumer {
                 current_tokens,
                 bucket_capacity,
             );
-            let providers = dispatcher.get_providers();
-            actix::spawn(async move {
-                for p in providers {
-                    p.log_metrics_summary().await;
-                }
-            });
+            // Note: Metrics logging is only available for EthHttpCli
+            // For FastEvmCli, metrics are not logged here
+            // TODO: Add metrics support to FastEvmCli if needed
         });
 
         let tps_info = if self.rate_limiter.max_tps == 0 {

@@ -434,6 +434,19 @@ impl Handler<UpdateSubmissionResult> for Producer {
         match msg.result.as_ref() {
             SubmissionResult::Success(_) => {
                 self.stats.success_txns += 1;
+                // Update nonce_cache when transaction succeeds
+                // The next nonce should be the current nonce + 1
+                let next_nonce = msg.metadata.nonce + 1;
+                // Only update if the new nonce is higher than what's cached
+                // This handles out-of-order transaction completions
+                self.nonce_cache
+                    .entry(msg.metadata.from_account_id.clone())
+                    .and_modify(|cached| {
+                        if next_nonce as u32 > *cached {
+                            *cached = next_nonce as u32;
+                        }
+                    })
+                    .or_insert(next_nonce as u32);
             }
             SubmissionResult::NonceTooLow { expect_nonce, .. } => {
                 self.stats.success_txns += 1;

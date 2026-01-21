@@ -1,0 +1,54 @@
+# Gravity Bench Configuration File
+
+# Uniswap configuration file path
+contract_config_path = "deploy.json"
+target_tps = 20000
+nodes = [
+    { rpc_url = "http://localhost:8545", chain_id = 7771625 },
+    { rpc_url = "http://localhost:8544", chain_id = 7771625 },
+    { rpc_url = "http://localhost:8543", chain_id = 7771625 },
+    { rpc_url = "http://localhost:8542", chain_id = 7771625 },
+]
+num_tokens=1
+enable_swap_token = false
+# Client type to use for sending transactions: "eth" (standard ETH RPC) or "fastevm" (custom rawtx RPC)
+# - "eth": Uses standard eth_sendRawTransaction and eth_sendRawTransactions methods
+# - "fastevm": Uses custom rawtx_sendRawTransactionAsync and rawtx_sendRawTransactionsAsync methods
+client_type = "fastevm"
+# Faucet and deployer account configuration
+[faucet]
+# Private key (example, please replace with real private key, the follows is a example of reth)
+private_key = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+# Faucet Level: Controls the depth of cascading faucet levels
+# Value 10: Enables cascade mode with progression 1 -> 10 -> 100 (amplification chain)
+# Value 0: Disables cascading, processes data directly
+faucet_level = 10
+# Wait duration in seconds between faucet distribution levels
+# If you encounter 'insufficient funds' errors, try increasing this value
+wait_duration_secs = 10
+fauce_eth_balance = "100000000000000000000000"
+
+# Load testing account configuration
+[accounts]
+# Number of load testing accounts to generate
+num_accounts = 100000
+
+# Performance and stress configuration
+[performance]
+# Number of concurrent transaction sending tasks inside TxnConsumer
+num_senders = 20
+# Maximum capacity of the transaction pool inside Consumer
+max_pool_size = 1000000
+# Duration of the benchmark in seconds. Set to 0 to run indefinitely.
+duration_secs = 1200
+# Batch size for batch transaction sending (0 = disabled, use individual sending)
+# Recommended: 500-5000 for optimal performance with eth_sendRawTransactions
+batch_size = 500
+# Batch timeout in milliseconds - send batch even if not full after this timeout
+# Recommended: 50-200ms for low latency, 200-500ms for higher throughput
+batch_timeout_ms = 500
+# Injection mode: "mempool" (via eth_sendRawTransactions) or "ordered_block" (via gravity_bench_submitBatch)
+# - "mempool": Transactions go through normal RPC to transaction pool (default)
+# - "ordered_block": Transactions bypass transaction pool and go directly to execution via OrderedBlock injection
+# Default: "mempool"
+injection_mode = "ordered_block"

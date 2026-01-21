@@ -10,9 +10,10 @@ package-lock.json
 package.json
 node_modules
 deploy.json
-bench_config.toml
 log
 log.log
 *.log
 venv/
 accounts.txt
+data
+__pycache__

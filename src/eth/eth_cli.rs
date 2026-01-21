@@ -7,7 +7,8 @@ use alloy::{
     rpc::types::TransactionReceipt,
 };
 use anyhow::{Context as AnyhowContext, Result};
-use comfy_table::{presets::UTF8_FULL, Cell, Table};
+use async_trait::async_trait;
+use comfy_table::{presets::UTF8_FULL, Attribute, Cell, Color, Table};
 use rand::Rng;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
@@ -16,6 +17,29 @@ use std::time::Instant;
 use tokio::time::{sleep, Duration};
 use tracing::{debug, info, warn};
 use url::Url;
+
+use crate::eth::tx_client::TransactionClient;
+
+/// Default wait time when buffer is full (1 second)
+const WAITING_FOR_BUFFER: Duration = Duration::from_secs(1);
+
+/// Response structure for gravity_submitBatch
+#[derive(Debug, Clone, serde::Deserialize)]
+struct SubmitBatchResponse {
+    /// Array of transaction hashes
+    pub hashes: Vec<TxHash>,
+    /// Current buffer size after adding transactions
+    pub buffer_size: usize,
+}
+
+/// Buffer status structure
+#[derive(Debug, Clone, serde::Deserialize)]
+struct BufferStatus {
+    /// Current number of queued transactions
+    pub queued: usize,
+    /// Maximum buffer size
+    pub max_size: usize,
+}
 
 /// Format large numbers with appropriate suffixes (K, M, B)
 fn format_large_number(num: u64) -> String {
@@ -228,22 +252,32 @@ impl EthHttpCli {
     }
 
     /// Get mempool status
+    /// Returns an error if the RPC method is not available (e.g., on FastEVM nodes)
+    /// This method does not retry on "Method not found" errors to avoid spam
     pub async fn get_mempool_status(&self) -> Result<MempoolStatus> {
         let start = Instant::now();
 
-        let result = self
-            .retry_with_backoff(|| async {
-                let result: MempoolStatus = self.inner[0]
-                    .raw_request::<(), MempoolStatus>("txpool_status".into(), ())
-                    .await?;
-                Ok(result)
-            })
+        // Call directly without retry - if method doesn't exist, return error immediately
+        let result = self.inner[0]
+            .raw_request::<(), MempoolStatus>("txpool_status".into(), ())
             .await;
 
         self.update_metrics("txpool_status", result.is_ok(), start.elapsed())
             .await;
 
-        result.with_context(|| "Failed to get mempool status")
+        // Check if it's a "Method not found" error by checking the error message
+        match result {
+            Err(e) => {
+                let error_str = e.to_string().to_lowercase();
+                // Check for "Method not found" error (code -32601)
+                if error_str.contains("method not found") || error_str.contains("-32601") {
+                    Err(anyhow::anyhow!("txpool_status method not available on this node (FastEVM nodes don't support this method)"))
+                } else {
+                    Err(anyhow::anyhow!("Failed to get mempool status: {}", e))
+                }
+            }
+            Ok(status) => Ok(status),
+        }
     }
 
     /// Get latest block number
@@ -446,6 +480,149 @@ impl EthHttpCli {
         final_result
     }
 
+    /// Get buffer status from the RPC node
+    async fn get_buffer_status(&self) -> Result<BufferStatus> {
+        let idx = rand::thread_rng().gen_range(0..self.inner.len());
+        let status: BufferStatus = self.inner[idx]
+            .raw_request::<(), BufferStatus>("gravity_getBufferStatus".into(), ())
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to get buffer status: {}", e))?;
+        Ok(status)
+    }
+
+    /// Send multiple raw transactions in a batch using eth_sendRawTransactions
+    ///
+    /// This is more efficient than calling send_raw_tx multiple times as it uses
+    /// a single RPC call with batch transaction pool insertion.
+    ///
+    /// Before submitting, checks if the buffer has space. If not, waits for WAITING_FOR_BUFFER
+    /// duration before retrying the check.
+    pub async fn send_raw_txs(&self, tx_bytes_vec: Vec<Vec<u8>>) -> Result<Vec<TxHash>> {
+        if tx_bytes_vec.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let batch_size = tx_bytes_vec.len();
+        let idx = rand::thread_rng().gen_range(0..self.inner.len());
+        let rpc_url = self.rpc.as_str();
+        let start = Instant::now();
+
+        // Convert Vec<Vec<u8>> to Vec<Bytes>
+        let transactions: Vec<alloy::primitives::Bytes> =
+            tx_bytes_vec.into_iter().map(|bytes| bytes.into()).collect();
+
+        // Retry loop: check buffer status and submit, retry indefinitely if buffer is full
+        // This ensures no transactions are lost
+        loop {
+            // Check buffer status before submitting
+            let buffer_has_space = match self.get_buffer_status().await {
+                Ok(status) => {
+                    if status.queued + batch_size > status.max_size {
+                        info!(
+                            "⏳ Buffer full: queued={}, max_size={}, batch_size={}. Waiting {}ms before retry",
+                            status.queued,
+                            status.max_size,
+                            batch_size,
+                            WAITING_FOR_BUFFER.as_millis()
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                }
+                Err(e) => {
+                    // If we can't get buffer status, log a warning but proceed anyway
+                    // This allows backward compatibility if the RPC method is not available
+                    warn!(
+                        "⚠️ Failed to get buffer status: {}. Proceeding with submission anyway.",
+                        e
+                    );
+                    true
+                }
+            };
+
+            if !buffer_has_space {
+                sleep(WAITING_FOR_BUFFER).await;
+                continue;
+            }
+
+            // Attempt to submit the batch
+            let op = async {
+                // Use the new batch RPC method
+                // Wrap in a tuple - raw_request expects parameters as a tuple
+                debug!(
+                    "Calling gravity_submitBatch RPC: batch_size={}, rpc={}",
+                    transactions.len(),
+                    rpc_url
+                );
+                let response: SubmitBatchResponse = self.inner[idx]
+                    .raw_request::<(Vec<alloy::primitives::Bytes>,), SubmitBatchResponse>(
+                        "gravity_submitBatch".into(),
+                        (transactions.clone(),),
+                    )
+                    .await?;
+                anyhow::Ok((response.hashes, response.buffer_size))
+            };
+
+            let result = tokio::time::timeout(Duration::from_secs(30), op).await;
+
+            match result {
+                Ok(Ok((hashes, buffer_size))) => {
+                    let elapsed = start.elapsed();
+                    info!(
+                        "✅ EthHttpCli: Batch RPC call succeeded: {} transactions sent in {:?} via gravity_submitBatch to {}, buffer_size={}",
+                        hashes.len(),
+                        elapsed,
+                        rpc_url,
+                        buffer_size
+                    );
+                    // Update metrics before returning
+                    self.update_metrics("eth_sendRawTransactions", true, elapsed)
+                        .await;
+                    return Ok(hashes);
+                }
+                Ok(Err(e)) => {
+                    let error_string = e.to_string().to_lowercase();
+
+                    // Check if error is due to buffer full - if so, retry
+                    if error_string.contains("buffer full")
+                        || error_string.contains("buffer is full")
+                    {
+                        warn!(
+                            "⏳ Buffer full error during submission: {}. Waiting {}ms before retry",
+                            e,
+                            WAITING_FOR_BUFFER.as_millis()
+                        );
+                        sleep(WAITING_FOR_BUFFER).await;
+                        continue; // Retry the submission
+                    }
+
+                    // For other errors, return them (non-buffer-full errors)
+                    let elapsed = start.elapsed();
+                    warn!(
+                        "❌ EthHttpCli: Batch RPC call failed: {} transactions failed after {:?}, rpc={}, error={}",
+                        batch_size,
+                        elapsed,
+                        rpc_url,
+                        e
+                    );
+                    // Update metrics before returning
+                    self.update_metrics("eth_sendRawTransactions", false, elapsed)
+                        .await;
+                    return Err(anyhow::Error::from(e));
+                }
+                Err(_) => {
+                    // Timeout - retry the submission
+                    warn!(
+                        "⏳ Batch RPC call timed out. Waiting {}ms before retry",
+                        WAITING_FOR_BUFFER.as_millis()
+                    );
+                    sleep(WAITING_FOR_BUFFER).await;
+                    continue; // Retry the submission
+                }
+            }
+        }
+    }
     /// Send signed transaction envelope
     #[allow(unused)]
     pub async fn send_tx_envelope(&self, tx_envelope: TxEnvelope) -> Result<TxHash> {
@@ -490,5 +667,24 @@ impl EthHttpCli {
     pub async fn get_account(&self, address: Address) -> Result<Account> {
         self.retry_with_backoff(|| async { self.inner[0].get_account(address).await })
             .await
+    }
+}
+
+#[async_trait]
+impl TransactionClient for EthHttpCli {
+    fn rpc(&self) -> Arc<String> {
+        EthHttpCli::rpc(self)
+    }
+
+    async fn get_txn_count(&self, address: Address) -> Result<u64> {
+        EthHttpCli::get_txn_count(self, address).await
+    }
+
+    async fn send_raw_tx(&self, tx_bytes: Vec<u8>) -> Result<TxHash> {
+        EthHttpCli::send_raw_tx(self, tx_bytes).await
+    }
+
+    async fn send_raw_txs(&self, tx_bytes_vec: Vec<Vec<u8>>) -> Result<Vec<TxHash>> {
+        EthHttpCli::send_raw_txs(self, tx_bytes_vec).await
     }
 }
