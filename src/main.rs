@@ -364,38 +364,22 @@ async fn start_bench() -> Result<()> {
     info!("📋 Configuration: client_type = '{}'", client_type);
 
     // Create clients based on client_type configuration
-    let (eth_clients, fastevm_clients) = if client_type == "fastevm" {
-        info!("✅ Using FastEVM client with rawtx RPC endpoints (rawtx_sendRawTransactionAsync, rawtx_sendRawTransactionsAsync)");
-        let fastevm_clients: Vec<FastEvmCli> = benchmark_config
-            .nodes
-            .iter()
-            .map(|node| {
-                info!("Creating FastEVM client for: {}", node.rpc_url);
-                FastEvmCli::new(&node.rpc_url, node.chain_id).unwrap()
-            })
-            .collect();
-        // Create EthHttpCli instances for nonce queries and other standard operations (NOT for sending transactions)
-        let eth_clients: Vec<Arc<EthHttpCli>> = benchmark_config
-            .nodes
-            .iter()
-            .map(|node| {
-                let client = EthHttpCli::new(&node.rpc_url, node.chain_id).unwrap();
-                Arc::new(client)
-            })
-            .collect();
-        (eth_clients, Some(fastevm_clients))
-    } else {
-        info!("✅ Using standard ETH client with eth RPC endpoints (eth_sendRawTransaction, gravity_submitBatch)");
-        let eth_clients: Vec<Arc<EthHttpCli>> = benchmark_config
-            .nodes
-            .iter()
-            .map(|node| {
-                let client = EthHttpCli::new(&node.rpc_url, node.chain_id).unwrap();
-                Arc::new(client)
-            })
-            .collect();
-        (eth_clients, None)
-    };
+    let eth_clients: Vec<Arc<EthHttpCli>> = benchmark_config
+        .nodes
+        .iter()
+        .map(|node| {
+            let client = EthHttpCli::new(&node.rpc_url, node.chain_id).unwrap();
+            Arc::new(client)
+        })
+        .collect();
+    let fastevm_clients: Vec<FastEvmCli> = benchmark_config
+        .nodes
+        .iter()
+        .map(|node| {
+            info!("Creating FastEVM client for: {}", node.rpc_url);
+            FastEvmCli::new(&node.rpc_url, node.chain_id).unwrap()
+        })
+        .collect();
 
     info!("Initializing Faucet constructor...");
     let mut start_nonce = contract_config.get_all_token().len() as u64;
@@ -470,14 +454,12 @@ async fn start_bench() -> Result<()> {
 
     // Create consumer with appropriate client type
     let consumer = if client_type == "fastevm" {
-        let fastevm_providers =
-            fastevm_clients.expect("FastEVM clients should be created when client_type='fastevm'");
         info!(
             "Creating Consumer with {} FastEVM providers",
-            fastevm_providers.len()
+            fastevm_clients.len()
         );
         Consumer::new_with_fastevm_providers(
-            fastevm_providers,
+            fastevm_clients,
             benchmark_config.performance.num_senders,
             monitor.clone(),
             benchmark_config.performance.max_pool_size,

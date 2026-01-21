@@ -5,9 +5,9 @@ contract_config_path = "deploy.json"
 target_tps = 20000
 nodes = [
     { rpc_url = "http://localhost:8545", chain_id = 7771625 },
-    { rpc_url = "http://localhost:8544", chain_id = 7771625 },
-    { rpc_url = "http://localhost:8543", chain_id = 7771625 },
-    { rpc_url = "http://localhost:8542", chain_id = 7771625 },
+    { rpc_url = "http://localhost:8545", chain_id = 7771625 },
+    { rpc_url = "http://localhost:8545", chain_id = 7771625 },
+    { rpc_url = "http://localhost:8545", chain_id = 7771625 },
 ]
 num_tokens=1
 enable_swap_token = false

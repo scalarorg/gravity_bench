@@ -1,4 +1,5 @@
 #!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Block Scanner Script
 # Scans blocks and lists all blocks with number of transactions greater than 0
@@ -96,6 +97,10 @@ get_execution_node_ip() {
 
 # Auto-detect RPC URL from execution node if not provided
 auto_detect_rpc_url() {
+    # Load environment variables from .env file
+    if [ -f "$SCRIPT_DIR/../.env" ]; then
+        source "$SCRIPT_DIR/../.env"
+    fi
     # If RPC_URL is already set, use it
     if [ -n "$RPC_URL" ]; then
         return 0
