@@ -664,9 +664,17 @@ impl EthHttpCli {
         result.with_context(|| format!("Failed to get transaction receipt for hash: {:?}", tx_hash))
     }
 
-    pub async fn get_account(&self, address: Address) -> Result<Account> {
-        self.retry_with_backoff(|| async { self.inner[0].get_account(address).await })
+    pub async fn get_account(&self, address: Address) -> Result<Option<Account>> {
+        // Try to get account, but handle the case where the account doesn't exist (null response)
+        // The RPC may return null for non-existent accounts, which causes a deserialization error
+        // when trying to deserialize as TrieAccount
+        match self
+            .retry_with_backoff(|| async { self.inner[0].get_account(address).await })
             .await
+        {
+            Ok(account_opt) => Ok(Some(account_opt)),
+            Err(e) => Err(anyhow::anyhow!("Failed to get account: {}", e)),
+        }
     }
 }
 

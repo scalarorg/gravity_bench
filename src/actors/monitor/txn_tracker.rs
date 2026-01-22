@@ -338,7 +338,7 @@ impl TxnTracker {
         impl std::future::Future<
             Output = (
                 PendingTxInfo,
-                Result<Account, anyhow::Error>,
+                Result<Option<Account>, anyhow::Error>,
                 Result<Option<alloy::rpc::types::TransactionReceipt>, anyhow::Error>,
             ),
         >,
@@ -401,7 +401,7 @@ impl TxnTracker {
         &mut self,
         results: Vec<(
             PendingTxInfo,
-            Result<Account, anyhow::Error>,
+            Result<Option<Account>, anyhow::Error>,
             Result<Option<alloy::rpc::types::TransactionReceipt>, anyhow::Error>,
         )>,
     ) -> Vec<RetryTxnInfo> {
@@ -419,12 +419,13 @@ impl TxnTracker {
                 }
                 Ok(None) => {
                     // Transaction still pending
-                    if let Ok(account) = account {
+                    if let Ok(Some(account)) = account {
                         if account.nonce > info.metadata.nonce {
                             successful_txns.push((info, true));
                         }
                     } else {
-                        failed_txns.push(info);
+                        // Account doesn't exist or error getting account - transaction still pending
+                        // Don't mark as failed, just continue monitoring
                     }
                 }
                 Err(e) => {
@@ -656,12 +657,7 @@ impl TxnTracker {
         table.load_preset(UTF8_FULL);
 
         // Set table header - summary statistics
-        table.set_header(vec![
-            "Metric",
-            "Value",
-            "Metric",
-            "Value",
-        ]);
+        table.set_header(vec!["Metric", "Value", "Metric", "Value"]);
 
         // Row 1: Txn progress and TPS
         table.add_row(vec![
