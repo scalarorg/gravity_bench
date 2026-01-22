@@ -566,6 +566,42 @@ impl Consumer {
         )
     }
 
+    /// Helper function to spawn a batch processing task
+    fn spawn_batch_processing_task(
+        batch: Vec<SignedTxnWithMetadata>,
+        dispatcher: Arc<dyn Dispatcher>,
+        monitor_addr: Addr<Monitor>,
+        transactions_sent: Arc<AtomicU64>,
+        transactions_sending: Arc<AtomicU64>,
+        semaphore: Arc<Semaphore>,
+        in_flight_tasks: &mut tokio::task::JoinSet<()>,
+    ) {
+        let dispatcher_clone = dispatcher.clone();
+        let monitor_addr_clone = monitor_addr.clone();
+        let transactions_sent_clone = transactions_sent.clone();
+        let transactions_sending_clone = transactions_sending.clone();
+        let semaphore_clone = semaphore.clone();
+
+        in_flight_tasks.spawn(async move {
+            let permit = match semaphore_clone.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    error!("Semaphore has been closed, cannot process batch.");
+                    return;
+                }
+            };
+            Self::process_batch(
+                permit,
+                batch,
+                dispatcher_clone,
+                monitor_addr_clone,
+                transactions_sent_clone,
+                transactions_sending_clone,
+            )
+            .await;
+        });
+    }
+
     /// Start transaction pool consumer
     fn start_pool_consumer(
         &self,
@@ -595,7 +631,6 @@ impl Consumer {
                 let batch_timeout = Duration::from_millis(batch_timeout_ms);
                 // Threshold: if buffer is below this, check timeout
                 let buffer_threshold = if batch_size > 0 { batch_size } else { 1 };
-
                 loop {
                     tokio::select! {
                         biased; // Prefer processing completed tasks to release semaphore permits
@@ -613,36 +648,19 @@ impl Consumer {
                                 if first_time.elapsed() >= batch_timeout {
                                     debug!("Buffer timeout reached ({}ms), processing {} buffered transactions", batch_timeout_ms, tx_buffer.len());
                                     
-                                    // Process buffer
-                                    // let current_phase = Phase::from_u8(phase.load(Ordering::Relaxed));                                    
-                                 
-                                    // Process as batch
+                                    // Process buffer as batch
                                     let batch = tx_buffer.drain(..).collect::<Vec<_>>();
                                     buffer_first_txn_time = None;
                                     
-                                    let dispatcher_clone = dispatcher.clone();
-                                    let monitor_addr_clone = monitor_addr.clone();
-                                    let transactions_sent_clone = transactions_sent.clone();
-                                    let transactions_sending_clone = transactions_sending.clone();
-                                    let semaphore_clone = semaphore.clone();
-                                    
-                                    in_flight_tasks.spawn(async move {
-                                        let permit = match semaphore_clone.acquire_owned().await {
-                                            Ok(permit) => permit,
-                                            Err(_) => {
-                                                error!("Semaphore has been closed, cannot process batch.");
-                                                return;
-                                            }
-                                        };
-                                        Self::process_batch(
-                                            permit,
-                                            batch,
-                                            dispatcher_clone,
-                                            monitor_addr_clone,
-                                            transactions_sent_clone,
-                                            transactions_sending_clone,
-                                        ).await;
-                                    });                                    
+                                    Self::spawn_batch_processing_task(
+                                        batch,
+                                        dispatcher.clone(),
+                                        monitor_addr.clone(),
+                                        transactions_sent.clone(),
+                                        transactions_sending.clone(),
+                                        semaphore.clone(),
+                                        &mut in_flight_tasks,
+                                    );
                                 }
                             }
                         }
@@ -683,16 +701,36 @@ impl Consumer {
                                     break;
                                 }
                             };
-
+                            // Add the transaction to the buffer
+                            tx_buffer.push(signed_txn);
+                            // Update the first transaction time
+                            if buffer_first_txn_time.is_none() {
+                                buffer_first_txn_time = Some(Instant::now());
+                            }
+                            if tx_buffer.len() >= buffer_threshold {
+                                // Process the buffer as batch
+                                let batch = tx_buffer.drain(..).collect::<Vec<_>>();
+                                buffer_first_txn_time = None;
+                                
+                                Self::spawn_batch_processing_task(
+                                    batch,
+                                    dispatcher.clone(),
+                                    monitor_addr.clone(),
+                                    transactions_sent.clone(),
+                                    transactions_sending.clone(),
+                                    semaphore.clone(),
+                                    &mut in_flight_tasks,
+                                );
+                            }
                             // [No changes] Put processing task into JoinSet
-                            in_flight_tasks.spawn(Self::process_transaction(
-                                permit,
-                                signed_txn,
-                                dispatcher.clone(),
-                                monitor_addr.clone(),
-                                transactions_sent.clone(),
-                                transactions_sending.clone(),
-                            ));
+                            // in_flight_tasks.spawn(Self::process_transaction(
+                            //     permit,
+                            //     signed_txn,
+                            //     dispatcher.clone(),
+                            //     monitor_addr.clone(),
+                            //     transactions_sent.clone(),
+                            //     transactions_sending.clone(),
+                            // ));
                         }
 
                         // Branch 4: Transaction pool is closed, process remaining buffer
@@ -701,36 +739,20 @@ impl Consumer {
                             if !tx_buffer.is_empty() {
                                 info!("Processing {} remaining buffered transactions before shutdown", tx_buffer.len());
                                 
-                                // let current_phase = Phase::from_u8(phase.load(Ordering::Relaxed));
-                                
                                 if tx_buffer.len() > 1 {
                                     // Process as batch
                                     let batch = tx_buffer.drain(..).collect::<Vec<_>>();
                                     buffer_first_txn_time = None;
                                     
-                                    let dispatcher_clone = dispatcher.clone();
-                                    let monitor_addr_clone = monitor_addr.clone();
-                                    let transactions_sent_clone = transactions_sent.clone();
-                                    let transactions_sending_clone = transactions_sending.clone();
-                                    let semaphore_clone = semaphore.clone();
-                                    
-                                    in_flight_tasks.spawn(async move {
-                                        let permit = match semaphore_clone.acquire_owned().await {
-                                            Ok(permit) => permit,
-                                            Err(_) => {
-                                                error!("Semaphore has been closed, cannot process batch.");
-                                                return;
-                                            }
-                                        };
-                                        Self::process_batch(
-                                            permit,
-                                            batch,
-                                            dispatcher_clone,
-                                            monitor_addr_clone,
-                                            transactions_sent_clone,
-                                            transactions_sending_clone,
-                                        ).await;
-                                    });
+                                    Self::spawn_batch_processing_task(
+                                        batch,
+                                        dispatcher.clone(),
+                                        monitor_addr.clone(),
+                                        transactions_sent.clone(),
+                                        transactions_sending.clone(),
+                                        semaphore.clone(),
+                                        &mut in_flight_tasks,
+                                    );
                                 } 
                             }
                             
